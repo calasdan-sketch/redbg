@@ -1,0 +1,187 @@
+# redbg — gdb for agent sessions
+
+Record tool-calling agent sessions, then debug them like a program:
+**step** forward/back through tool calls, **inspect** the exact
+prompt/response at each step, **diff** two runs to find where they
+diverged, and **fork** a session at any step to explore what-if
+scenarios. Local-first, zero dependencies.
+
+```
+$ redbg diff monday.jsonl tuesday.jsonl
+
+✗ First divergence at A:3 / B:3: same tool 'read_file' with same args,
+  but A succeeded and B FAILED
+
+    A      B     tool (A → B)                  note
+───────────────────────────────────────────────────────────────────────
+    1      1  =  read_file                     output same
+    2      2  =  read_file                     output same
+    3      3  ≠  read_file                     status changed; output DIFFERS
+    4      4  ~  exec                          args changed; output DIFFERS
+
+── args diff at divergence ──
+...
+```
+
+## Install
+
+```bash
+pip install redbg
+```
+
+Python 3.9+. No runtime dependencies — it installs anywhere.
+
+## Quickstart
+
+**1. Record.** Wrap your tool-calling loop with `Recorder`:
+
+```python
+from redbg import Recorder
+
+with Recorder("session.jsonl", agent="my-agent") as rec:
+    rec.prompt("user", "Summarize main.py")
+    call = rec.tool_call("read_file", {"path": "main.py"})
+    try:
+        text = open("main.py").read()
+    except OSError as exc:
+        rec.tool_result(call, ok=False, error=str(exc))
+    else:
+        rec.tool_result(call, ok=True, output=text)
+    rec.response("main.py prints hello.")
+```
+
+Or decorate tool functions — calls and results are recorded automatically,
+exceptions become failed results:
+
+```python
+with Recorder("session.jsonl") as rec:
+    @rec.wrap
+    def read_file(path): ...
+```
+
+**2. Replay.** Step through like a debugger:
+
+```bash
+$ redbg replay session.jsonl
+(redbg –/4) n        # step into the first tool call
+(redbg 1/4) s        # show full details: args, output, duration, context
+(redbg 1/4) /main.py # search tool/args/output
+(redbg 1/4) t        # timing table for all steps
+(redbg 1/4) q
+```
+
+Non-interactive: `--list`, `--show N`, `--cmd "n;n;s"`, `--export-md report.md`.
+
+**3. Diff.** Find where two runs diverged:
+
+```bash
+$ redbg diff monday.jsonl tuesday.jsonl
+```
+
+Aligns the step streams (LCS sequence alignment), headlines the first
+divergence, prints a side-by-side table (`=` same, `~` args changed,
+`!` tool changed, `≠` status changed, `+`/`-` added/removed), then a
+field-level diff at the divergence point.
+
+**4. Fork.** Re-run the tail of a session with modified input:
+
+```bash
+$ redbg fork tuesday.jsonl --at 3 \
+    --override-args '{"path": "main.py"}' \
+    --tools my_tools.py \
+    --save fork.jsonl
+```
+
+`my_tools.py` defines `TOOLS = {"read_file": callable, ...}` (and
+optionally `MODEL` for live mode). Two strategies:
+
+- `playback` (default): recorded model responses are replayed verbatim;
+  tool calls are **re-executed** against your implementations. Deterministic
+  and free — answers "with this different input, does my loop logic still
+  behave?"
+- `live`: your `MODEL(messages)` is actually called each turn. Answers
+  "what would the model do now?" — non-deterministic, may cost money.
+
+Every forked trace carries provenance (`forked_from`, `at_step`,
+`strategy`) so a fork is never mistaken for an original recording.
+
+## More commands
+
+```bash
+redbg info session.jsonl            # summary: steps, failures, tool time
+redbg scan session.jsonl            # audit for likely secrets (exit 1 if found)
+redbg redact raw.jsonl -o clean.jsonl   # strip secrets before sharing
+redbg import otel.json -o out.jsonl     # convert OTel/Langfuse-shaped traces
+```
+
+`redbg` reads `.jsonl.gz` transparently everywhere a trace is accepted.
+
+## Python API
+
+```python
+from redbg import Session, Navigator, render_diff, ForkSpec, fork_session
+
+a, b = Session.load("monday.jsonl"), Session.load("tuesday.jsonl")
+print(render_diff(a, b, use_color=False))
+
+nav = Navigator(a)
+nav.next(); nav.prev(); nav.goto(3)
+
+spec = ForkSpec(at_step=3, strategy="playback",
+                override_args={"path": "main.py"},
+                tool_impls={"read_file": lambda args: open(args["path"]).read()})
+forked = fork_session(b, spec)
+forked.save("fork.jsonl")
+```
+
+## Trace format
+
+One JSON object per line (JSONL), append-only, stream-written — a crashed
+run still leaves a usable partial trace. Event types: `session_start`,
+`prompt`, `response`, `tool_call`, `tool_result`, `note`, `session_end`.
+A *step* is one `tool_call`/`tool_result` pair. Unknown event types are
+preserved on load (a newer recorder's trace still opens) but ignored by the
+step engine. See `examples/sample-a.jsonl`.
+
+## Importing existing traces
+
+`redbg import` converts OTel-shaped spans and Langfuse-shaped observations
+(`{"observations": [...]}` / `{"spans": [...]}` / `{"traces": [...]}`) into
+redbg format. It is heuristic and lossy by design — spans whose names
+mention tools become tool steps, generation spans become responses,
+everything else becomes notes. Always verify with `redbg info` afterward.
+
+## Secrets
+
+The recorder redacts by default: values of keys matching
+`api_key|secret|token|password|...` and strings shaped like known tokens
+(`sk-…`, `ghp_…`, `xox…`, `AKIA…`, PEM keys). Tool outputs are truncated
+at 20,000 chars (configurable via `max_output_chars`) with a SHA-256 of the
+full output retained so diffs still detect changes. Run `redbg scan`
+before sharing any trace, and `redbg redact` to clean one.
+
+## Limitations (honest)
+
+- **Playback forks don't model the model.** Replaying recorded model text
+  with different tool inputs shows you what your *loop logic* does, not what
+  the *LLM* would have said. Use `live` for true what-if on model behavior —
+  and accept that live forks are non-deterministic experiments, not
+  reproductions.
+- **No framework auto-instrumentation.** redbg won't monkeypatch LangChain,
+  AutoGen, or the Claude Agent SDK — explicit `Recorder` hooks only.
+  Adapters are a documented v2 extension point, not a v1 feature.
+- **Diff aligns sequences; it doesn't understand intent.** Reordered steps
+  surface as deletions + insertions (never a fabricated "moved"). Semantically
+  equivalent but textually different args (e.g. `{"a":1}` vs `{"a": 1.0}`)
+  count as changed.
+- **Single-agent sessions.** Multi-agent / swarm traces (parallel tool calls
+  across agents) load, but the step engine treats them as one flat sequence.
+- **Timestamps are wall-clock.** Cross-machine comparison of durations is
+  approximate; `mono` deltas are only meaningful within one recording host.
+- **Import is lossy.** Anything the heuristics don't recognize becomes a
+  `note` — check the result before trusting a diff built on imported data.
+
+## Roadmap (v2, not promised)
+
+Framework adapters · full TUI · SQLite export for ad-hoc queries · remote
+trace ingestion · multi-agent step views.

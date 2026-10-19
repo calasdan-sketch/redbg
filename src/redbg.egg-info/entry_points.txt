@@ -1,0 +1,2 @@
+[console_scripts]
+redbg = redbg.cli:main
