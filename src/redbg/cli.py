@@ -3,6 +3,7 @@
 Subcommands:
   replay TRACE        interactive debugger REPL (step next/prev, inspect)
   diff A B            side-by-side divergence report for two sessions
+  check TRACE         CI gate: regressions vs --baseline, budgets, loops
   fork TRACE --at N   re-run the tail of a session with modified input
   redact SRC -o DST   strip secrets from a trace
   scan TRACE          audit a trace for likely secrets (exit 1 if found)
@@ -15,15 +16,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import runpy
 import sys
 
 from . import __version__
-from .diff import render_diff
+from ._text import clean, md_fence
+from .check import FAIL_ON_CHOICES, CheckRules, run_check
+from .diff import diff_to_dict, find_repeats, render_diff
 from .fork import ForkSpec, fork_session
 from .importer import import_file
 from .redact import redact_file, scan_file
-from .replay import Navigator, Session
+from .replay import Navigator, Session, ensure_distinct
 
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -56,9 +60,11 @@ def _fmt_ms(ms: float | None) -> str:
 
 
 def _truncate(text: str, limit: int = 2000) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n…[{len(text) - limit} more chars]"
+    # Sanitize *after* truncating so the limit applies to real content,
+    # and every display path gets control characters neutralized.
+    if len(text) > limit:
+        text = text[:limit] + f"\n…[{len(text) - limit} more chars]"
+    return clean(text)
 
 
 def render_step(step, total: int, color: bool, show_context: bool = True) -> str:
@@ -67,7 +73,7 @@ def render_step(step, total: int, color: bool, show_context: bool = True) -> str
     status_c = _c(status, GREEN if step.ok else RED, color)
     lines = [
         _c(
-            f"── step {step.n}/{total} · {step.tool} · {status_c} · "
+            f"── step {step.n}/{total} · {clean(step.tool)} · {status_c} · "
             f"{_fmt_ms(step.duration_ms)} ──",
             BOLD,
             color,
@@ -99,7 +105,9 @@ def render_list(session: Session, color: bool) -> str:
     for step in session.steps:
         mark = "✓" if step.ok else ("✗" if step.ok is False else "?")
         mark = _c(mark, GREEN if step.ok else RED, color)
-        lines.append(f"{step.n:>4} {mark} {_fmt_ms(step.duration_ms):>10}  {step.tool}")
+        lines.append(
+            f"{step.n:>4} {mark} {_fmt_ms(step.duration_ms):>10}  {clean(step.tool)}"
+        )
     return "\n".join(lines)
 
 
@@ -114,55 +122,79 @@ def render_info(session: Session, color: bool) -> str:
         if step.duration_ms:
             total_ms += step.duration_ms
     lines = [
-        _c(f"session: {session.path}", BOLD, color),
-        f"  agent:      {session.agent}",
-        f"  session id: {session.session_id}",
-        f"  status:     {session.status}",
+        _c(f"session: {clean(session.path)}", BOLD, color),
+        f"  agent:      {clean(session.agent)}",
+        f"  session id: {clean(session.session_id)}",
+        f"  status:     {clean(session.status)}",
         f"  steps:      {len(session.steps)}",
         f"  failed:     {failed}",
         f"  tool time:  {_fmt_ms(total_ms)}",
         f"  prompts:    {len(session.prompts)}",
         f"  responses:  {len(session.responses)}",
         "  tools:      "
-        + ", ".join(f"{name}×{count}" for name, count in sorted(tools.items())),
+        + ", ".join(f"{clean(name)}×{count}" for name, count in sorted(tools.items())),
     ]
+    repeats = find_repeats(session)
+    if repeats:
+        worst = max(repeats, key=lambda r: r.count)
+        lines.append(
+            _c(
+                f"  repeats:    {len(repeats)} run(s) of identical consecutive calls; "
+                f"longest {clean(worst.tool)}×{worst.count} "
+                f"(steps {worst.first}-{worst.last}) — possible loop",
+                YELLOW,
+                color,
+            )
+        )
     return "\n".join(lines)
+
+
+def _md_inline(text) -> str:
+    """Render untrusted text as a Markdown code span it cannot escape.
+
+    Inside a code span nothing is interpreted (no links, HTML or
+    emphasis); the delimiter is longer than any backtick run inside.
+    """
+    text = clean(text).replace("\n", " ")
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    tick = "`" * (longest + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{tick}{pad}{text}{pad}{tick}"
 
 
 def export_markdown(session: Session) -> str:
     lines = [
-        f"# redbg session: `{session.path}`",
+        f"# redbg session: {_md_inline(session.path)}",
         "",
-        f"- agent: {session.agent}",
-        f"- session id: {session.session_id}",
-        f"- status: {session.status}",
+        f"- agent: {_md_inline(session.agent)}",
+        f"- session id: {_md_inline(session.session_id)}",
+        f"- status: {_md_inline(session.status)}",
         f"- steps: {len(session.steps)}",
         "",
     ]
     for step in session.steps:
-        status = "ok" if step.ok else "FAIL"
+        status = "ok" if step.ok else ("FAIL" if step.ok is False else "no result")
         lines.append(
-            f"## step {step.n}: `{step.tool}` ({status}, {_fmt_ms(step.duration_ms)})"
+            f"## step {step.n}: {_md_inline(step.tool)} "
+            f"({status}, {_fmt_ms(step.duration_ms)})"
         )
         lines.append("")
-        lines.append("```json")
-        lines.append(
-            json.dumps(
-                step.args, indent=2, sort_keys=True, default=str, ensure_ascii=False
-            )
+        args_json = json.dumps(
+            step.args, indent=2, sort_keys=True, default=str, ensure_ascii=False
         )
-        lines.append("```")
+        lines.append(md_fence(clean(args_json), "json"))
         if step.output:
             lines.append("")
             lines.append("<details><summary>output</summary>")
             lines.append("")
-            lines.append("```")
-            lines.append(_truncate(step.output, 4000))
-            lines.append("```")
+            lines.append(md_fence(_truncate(step.output, 4000)))
+            lines.append("")
             lines.append("</details>")
         if step.error:
             lines.append("")
-            lines.append(f"**error:** {step.error}")
+            lines.append("**error:**")
+            lines.append("")
+            lines.append(md_fence(_truncate(step.error, 4000)))
         lines.append("")
     return "\n".join(lines)
 
@@ -342,9 +374,68 @@ def cmd_diff(args) -> int:
     except (ValueError, OSError) as exc:
         print(f"redbg: {exc}", file=sys.stderr)
         return 2
+    ignore = _split_csv(args.ignore_keys)
+    if args.json:
+        print(json.dumps(diff_to_dict(a, b, ignore), indent=2, default=str))
+        return 0
     color = _color_enabled() and not args.no_color
-    print(render_diff(a, b, use_color=color))
+    print(render_diff(a, b, use_color=color, ignore_keys=ignore))
     return 0
+
+
+def _split_csv(value) -> tuple[str, ...]:
+    """Flatten repeatable, comma-separated option values."""
+    if not value:
+        return ()
+    items = value if isinstance(value, list) else [value]
+    return tuple(p.strip() for item in items for p in item.split(",") if p.strip())
+
+
+def cmd_check(args) -> int:
+    try:
+        candidate = Session.load(args.trace, skip_bad=args.skip_bad)
+        baseline = (
+            Session.load(args.baseline, skip_bad=args.skip_bad)
+            if args.baseline
+            else None
+        )
+        fail_on = _split_csv(args.fail_on)
+        rules = CheckRules(
+            require_complete=not args.allow_incomplete,
+            max_steps=args.max_steps,
+            max_failures=args.max_failures,
+            forbid_tools=list(_split_csv(args.forbid_tool)),
+            require_tools=list(_split_csv(args.require_tool)),
+            max_repeats=args.max_repeats,
+            ignore_keys=_split_csv(args.ignore_keys),
+            allow_empty=args.allow_empty,
+            **({"fail_on": fail_on} if fail_on else {}),
+        )
+    except (ValueError, OSError) as exc:
+        print(f"redbg: {exc}", file=sys.stderr)
+        return 2
+    result = run_check(candidate, rules, baseline)
+    if args.json:
+        print(json.dumps(result.to_dict(), indent=2, default=str))
+        return 0 if result.passed else 1
+    color = _color_enabled() and not args.no_color
+    target = clean(result.candidate)
+    if result.baseline:
+        target += f" vs baseline {clean(result.baseline)}"
+    checked = ", ".join(result.checked) or "nothing"
+    if result.passed:
+        print(_c(f"✓ check passed: {target}", GREEN, color))
+        print(_c(f"  rules: {checked}", DIM, color))
+        return 0
+    print(_c(f"✗ check FAILED: {target}", RED + BOLD, color))
+    shown = result.violations[: args.limit] if args.limit > 0 else result.violations
+    for v in shown:
+        print(f"  [{v.rule}] {clean(v.message)}")
+    hidden = len(result.violations) - len(shown)
+    if hidden > 0:
+        print(_c(f"  … {hidden} more (use --limit 0 to show all)", DIM, color))
+    print(_c(f"  rules: {checked}", DIM, color))
+    return 1
 
 
 def _load_tools_module(path: str) -> tuple[dict, object]:
@@ -357,6 +448,9 @@ def _load_tools_module(path: str) -> tuple[dict, object]:
 
 def cmd_fork(args) -> int:
     try:
+        if args.save:
+            # The fork would otherwise silently replace the original trace.
+            ensure_distinct(args.trace, args.save)
         session = Session.load(args.trace, skip_bad=args.skip_bad)
     except (ValueError, OSError) as exc:
         print(f"redbg: {exc}", file=sys.stderr)
@@ -398,14 +492,20 @@ def cmd_fork(args) -> int:
         for event in forked.events:
             if event.get("type") == "tool_call":
                 print(
-                    f"step {event['step']}: {event['tool']} "
-                    f"{json.dumps(event.get('args', {}), default=str)[:100]}"
+                    clean(
+                        f"step {event['step']}: {event['tool']} "
+                        f"{json.dumps(event.get('args', {}), default=str)[:100]}"
+                    )
                 )
     return 0
 
 
 def cmd_redact(args) -> int:
-    stats = redact_file(args.src, args.dst)
+    try:
+        stats = redact_file(args.src, args.dst)
+    except (ValueError, OSError) as exc:
+        print(f"redbg: {exc}", file=sys.stderr)
+        return 2
     print(
         f"redacted {stats['redactions']} value(s) across "
         f"{stats['events']} events -> {stats['dst']}"
@@ -414,15 +514,21 @@ def cmd_redact(args) -> int:
 
 
 def cmd_scan(args) -> int:
-    findings = scan_file(args.trace)
+    try:
+        findings = scan_file(args.trace)
+    except (ValueError, OSError) as exc:
+        print(f"redbg: {exc}", file=sys.stderr)
+        return 2
     if not findings:
         print("scan clean: no likely secrets found.")
         return 0
     print(f"found {len(findings)} suspicious value(s):")
     for finding in findings:
         print(
-            f"  line {finding.line_no} [{finding.field}]: "
-            f"{finding.preview} ({finding.reason})"
+            clean(
+                f"  line {finding.line_no} [{finding.field}]: "
+                f"{finding.preview} ({finding.reason})"
+            )
         )
     print("hint: run `redbg redact` before sharing this trace.")
     return 1
@@ -491,8 +597,69 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("diff", help="diff two sessions, find the divergence")
     p.add_argument("a")
     p.add_argument("b")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument(
+        "--ignore-keys",
+        action="append",
+        metavar="K1,K2",
+        help="arg keys to ignore when comparing (any depth); repeatable",
+    )
     _add_common(p)
     p.set_defaults(func=cmd_diff)
+
+    p = sub.add_parser(
+        "check",
+        help="CI gate: fail (exit 1) on regressions vs a baseline or rule breaks",
+        description="Exit 0 = pass, 1 = violations, 2 = could not run. By "
+        "default the session must have finished with status ok, every step "
+        "must have a result (disable with --allow-incomplete), and the trace "
+        "must contain at least one tool step (disable with --allow-empty).",
+    )
+    p.add_argument("trace", help="candidate session to check")
+    p.add_argument(
+        "--baseline", metavar="TRACE", help="known-good session to compare against"
+    )
+    p.add_argument(
+        "--fail-on",
+        action="append",
+        metavar="KINDS",
+        help="baseline diff kinds that fail the check (default: all changes). "
+        "choices: " + ",".join(FAIL_ON_CHOICES),
+    )
+    p.add_argument("--ignore-keys", action="append", metavar="K1,K2")
+    p.add_argument("--max-steps", type=int, metavar="N")
+    p.add_argument("--max-failures", type=int, metavar="N")
+    p.add_argument(
+        "--max-repeats",
+        type=int,
+        metavar="N",
+        help="fail if any tool is called more than N times in a row "
+        "with identical args (loop detector)",
+    )
+    p.add_argument(
+        "--forbid-tool",
+        action="append",
+        metavar="GLOB",
+        help="fail if any call matches (e.g. 'delete_*'); repeatable",
+    )
+    p.add_argument(
+        "--require-tool",
+        action="append",
+        metavar="GLOB",
+        help="fail unless some call matches; repeatable",
+    )
+    p.add_argument("--allow-incomplete", action="store_true")
+    p.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="accept a trace with zero tool steps / a check with no rules",
+    )
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument(
+        "--limit", type=int, default=50, help="max violations to print (0 = all)"
+    )
+    _add_common(p)
+    p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("fork", help="re-run a session tail with new input")
     p.add_argument("trace")
@@ -555,7 +722,17 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except RecursionError:
+        # A pathologically nested trace (or tool result) — "could not run",
+        # never a traceback and never exit 1 (which means "violations").
+        print(
+            "redbg: input is nested too deeply to process "
+            "(raise sys.setrecursionlimit or flatten the data)",
+            file=sys.stderr,
+        )
+        return 2
 
 
 if __name__ == "__main__":

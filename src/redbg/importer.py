@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 
+from .replay import ensure_distinct
 from .schema import (
     NOTE,
     RESPONSE,
@@ -182,6 +183,7 @@ def import_events(obj) -> list[dict]:
 
 def import_file(src: str, dst: str) -> dict:
     """Read an external trace file, write redbg JSONL. Returns stats."""
+    ensure_distinct(src, dst)
     with open(src, encoding="utf-8") as handle:
         obj = json.load(handle)
     events = import_events(obj)

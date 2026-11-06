@@ -3,6 +3,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from conftest import record_session  # noqa: E402
+
 from redbg import (  # noqa: E402
     Session,
     align_steps,
@@ -10,7 +12,6 @@ from redbg import (  # noqa: E402
     render_diff,
 )
 from redbg.diff import ARGS_CHANGED, TOOL_CHANGED  # noqa: E402
-from tests.conftest import record_session  # noqa: E402
 
 
 def test_identical_sessions_have_no_divergence(trace_ok):
