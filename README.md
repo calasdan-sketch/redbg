@@ -1,10 +1,13 @@
 # redbg — gdb for agent sessions
 
+**Find the exact step where your agent went wrong — and fail CI when it
+happens again.** Local files, no account, no server, zero dependencies.
+
 Record tool-calling agent sessions, then debug them like a program:
 **step** forward/back through tool calls, **inspect** the exact
 prompt/response at each step, **diff** two runs to find where they
-diverged, and **fork** a session at any step to explore what-if
-scenarios. Local-first, zero dependencies.
+diverged, **fork** a session at any step to explore what-if
+scenarios, and **check** a run against a known-good baseline in CI.
 
 ```
 $ redbg diff monday.jsonl tuesday.jsonl
@@ -31,6 +34,22 @@ pip install redbg
 
 Python 3.9+. No runtime dependencies — it installs anywhere.
 
+**Try it in 30 seconds** (from a clone of this repo; uses the two sample
+traces in `examples/`):
+
+```bash
+redbg diff  examples/sample-a.jsonl examples/sample-b.jsonl
+redbg check examples/sample-b.jsonl --baseline examples/sample-a.jsonl; echo "exit=$?"
+```
+
+```
+✗ check FAILED: examples/sample-b.jsonl vs baseline examples/sample-a.jsonl
+  [divergence] First divergence at A:— / B:1: step added in B ('read_file')
+  [added] baseline:— / candidate:1 'read_file': added
+  rules: complete, baseline
+exit=1
+```
+
 ## Quickstart
 
 **1. Record.** Wrap your tool-calling loop with `Recorder`:
@@ -51,12 +70,19 @@ with Recorder("session.jsonl", agent="my-agent") as rec:
 ```
 
 Or decorate tool functions — calls and results are recorded automatically,
-exceptions become failed results:
+exceptions become failed results. `async def` tools and objects with an
+`async def __call__` work too (the awaited value is recorded, and concurrent
+`asyncio.gather` calls pair correctly). Generator functions (sync or async)
+are rejected with a clear `TypeError` — a wrapper only sees the generator
+object, so wrap the code that consumes it instead:
 
 ```python
 with Recorder("session.jsonl") as rec:
     @rec.wrap
     def read_file(path): ...
+
+    @rec.wrap
+    async def fetch(url): ...
 ```
 
 **2. Replay.** Step through like a debugger:
@@ -78,7 +104,8 @@ Non-interactive: `--list`, `--show N`, `--cmd "n;n;s"`, `--export-md report.md`.
 $ redbg diff monday.jsonl tuesday.jsonl
 ```
 
-Aligns the step streams (LCS sequence alignment), headlines the first
+Aligns the step streams (`difflib.SequenceMatcher` sequence alignment),
+headlines the first
 divergence, prints a side-by-side table (`=` same, `~` args changed,
 `!` tool changed, `≠` status changed, `+`/`-` added/removed), then a
 field-level diff at the divergence point.
@@ -105,10 +132,45 @@ optionally `MODEL` for live mode). Two strategies:
 Every forked trace carries provenance (`forked_from`, `at_step`,
 `strategy`) so a fork is never mistaken for an original recording.
 
+**5. Check (CI gate).** Fail the build when a run regresses or breaks a
+rule. Exit codes: `0` pass, `1` violations, `2` could not run.
+
+```bash
+redbg check run.jsonl --baseline golden.jsonl \
+    --ignore-keys request_id,timestamp \
+    --fail-on tool_changed,status_changed,removed \
+    --max-steps 40 --max-failures 0 --max-repeats 3 \
+    --forbid-tool 'delete_*' --forbid-tool shell \
+    --require-tool write_report
+```
+
+| rule | fails when |
+|---|---|
+| *(always, unless `--allow-incomplete`)* | the session has no `session_end`, ended with status `error`, or a step has no result |
+| *(always, unless `--allow-empty`)* | the trace has zero tool steps (empty, garbage, or crashed before the first call), or no rule was evaluated at all — a broken recorder must not pass CI |
+| `--baseline FILE` | the aligned diff vs the baseline contains a kind in `--fail-on` (default: every change — `args_changed`, `tool_changed`, `status_changed`, `added`, `removed`; `output_changed` is opt-in because outputs often vary) |
+| `--max-steps N` / `--max-failures N` | more than N steps / failed steps |
+| `--max-repeats N` | a tool is called more than N times **in a row with identical args** — the usual shape of a stuck loop |
+| `--forbid-tool GLOB` / `--require-tool GLOB` | a call matches / no call matches (shell globs, matched case-insensitively after Unicode NFKC normalization with zero-width/bidi characters removed — so `Delete_File` and full-width `ｄelete_file` both match `delete_*`) |
+
+`--json` prints a machine-readable result; options taking lists accept
+commas or repetition. In GitHub Actions:
+
+```yaml
+- run: pip install redbg
+- run: python run_agent_eval.py --trace run.jsonl   # your harness, records with Recorder
+- run: redbg check run.jsonl --baseline tests/golden.jsonl --max-repeats 3
+```
+
+From Python: `run_check(Session.load("run.jsonl"), CheckRules(max_repeats=3),
+baseline=Session.load("golden.jsonl")).passed`.
+
 ## More commands
 
 ```bash
-redbg info session.jsonl            # summary: steps, failures, tool time
+redbg info session.jsonl            # summary: steps, failures, tool time, loops
+redbg diff a.jsonl b.jsonl --json   # machine-readable diff
+redbg diff a.jsonl b.jsonl --ignore-keys request_id   # ignore noisy args
 redbg scan session.jsonl            # audit for likely secrets (exit 1 if found)
 redbg redact raw.jsonl -o clean.jsonl   # strip secrets before sharing
 redbg import otel.json -o out.jsonl     # convert OTel/Langfuse-shaped traces
@@ -151,11 +213,57 @@ redbg format. It is heuristic and lossy by design — spans whose names
 mention tools become tool steps, generation spans become responses,
 everything else becomes notes. Always verify with `redbg info` afterward.
 
-## Secrets
+## Secrets and safety
 
-The recorder redacts by default: values of keys matching
-`api_key|secret|token|password|...` and strings shaped like known tokens
-(`sk-…`, `ghp_…`, `xox…`, `AKIA…`, PEM keys). Tool outputs are truncated
+The recorder redacts by default (and `redbg redact` applies the same rules
+to an existing trace):
+
+- **By key name** — the whole value under a structured (dict) key matching
+  `api_key|secret|token|password|auth…|bearer|credential|private_key|ssn|card_number|...`
+  in args, results and metadata.
+- **By shape, anywhere inside a string** — OpenAI (`sk-…`, `sk-proj-…`,
+  `sk-svcacct-…`), Anthropic (`sk-ant-…`), GitHub (`ghp_/gho_/ghu_/ghs_/ghr_…`,
+  `github_pat_…`), Slack tokens and webhooks, Stripe (`sk_live_…`,
+  `rk_test_…`), AWS key ids (`AKIA…`), Google (`AIza…`), Hugging Face
+  (`hf_…`), JWTs, and **the whole PEM private-key block** (header, body and
+  footer; an unterminated block is redacted to the end of the string).
+- **Free-text credentials** — `Bearer …` values (any spacing, `Bearer:`
+  too; 8+ chars containing a digit, so prose like "the bearer of…"
+  survives), `Basic …` values (base64 with a digit, `+`, `/` or `=`),
+  `user:password@` in URLs, and `KEY=value` / `KEY: value` assignments
+  (value 4+ chars) whose key name contains `api_key`/`apikey`, `secret`,
+  `token`, `password`/`passwd`, `pwd`, `credential`, `private_key`,
+  `access_key` or `session_key` — which covers
+  `.env` / `export` lines, YAML/HTTP-header style lines, JSON-in-text and
+  query strings like `?api_key=…&`. The key name is kept
+  (`OPENAI_API_KEY=[REDACTED]`) so the trace stays readable.
+
+Kept on purpose, so cost and usage stay debuggable: numeric (or
+digit-only string) LLM usage counters such as `max_tokens`,
+`prompt_tokens`, `totalTokenCount` and `token_count`, the
+`*_tokens_details` dicts (each field inside is still checked), and keys
+like `author`. A count key that also names a secret (`secret_tokens`,
+`access_token_count`) is still redacted. Values nested more than 100 levels
+deep are redacted rather than inspected.
+
+**Limits:** this is pattern matching — a safety net, not a guarantee. It
+will miss secrets with no recognizable shape or key name (a bare
+password on its own line, a custom token format) and can occasionally
+redact a harmless `token: value`-shaped line. Always run `redbg scan`
+before sharing a trace; it checks the same rules.
+
+Traces are treated as untrusted input: control characters (ANSI/OSC
+escapes, `\r`) and invisible/format characters (bidi overrides such as
+U+202E, zero-width characters, U+2028/2029) in tool names, args and
+outputs are shown escaped (`\x1b[2J`, `\u202e`), so a crafted trace cannot
+drive your terminal or disguise one tool name as another. Markdown
+reports fence content so it cannot inject headings/HTML. `redact`,
+`import` and `fork --save` refuse to overwrite their own input file.
+Pathologically nested traces exit with code 2 instead of crashing.
+`fork --tools FILE` *executes* that Python file — only point it at code
+you trust.
+
+Tool outputs are truncated
 at 20,000 chars (configurable via `max_output_chars`) with a SHA-256 of the
 full output retained so diffs still detect changes. Run `redbg scan`
 before sharing any trace, and `redbg redact` to clean one.
@@ -171,15 +279,41 @@ before sharing any trace, and `redbg redact` to clean one.
   AutoGen, or the Claude Agent SDK — explicit `Recorder` hooks only.
   Adapters are a documented v2 extension point, not a v1 feature.
 - **Diff aligns sequences; it doesn't understand intent.** Reordered steps
-  surface as deletions + insertions (never a fabricated "moved"). Semantically
-  equivalent but textually different args (e.g. `{"a":1}` vs `{"a": 1.0}`)
-  count as changed.
+  surface as deletions + insertions (never a fabricated "moved"). Args are
+  canonicalized (key order ignored, `1.0` == `1`, `--ignore-keys` drops
+  noisy fields), but semantically equal values with different text
+  (`"1"` vs `1`, reworded strings) still count as changed.
+- **The loop detector only sees back-to-back repeats.** Alternating
+  cycles (`a, b, a, b, …`) aren't flagged by `--max-repeats`; use
+  `--max-steps` as a backstop.
 - **Single-agent sessions.** Multi-agent / swarm traces (parallel tool calls
   across agents) load, but the step engine treats them as one flat sequence.
 - **Timestamps are wall-clock.** Cross-machine comparison of durations is
   approximate; `mono` deltas are only meaningful within one recording host.
 - **Import is lossy.** Anything the heuristics don't recognize becomes a
   `note` — check the result before trusting a diff built on imported data.
+
+## How it compares
+
+Only statements we could check against each project's own page are listed.
+
+| | redbg | [rewind](https://github.com/risjai/rewind) | [LangGraph time travel](https://docs.langchain.com/oss/python/langgraph/use-time-travel) | [AgentOps](https://microsoft.github.io/autogen/0.2/docs/ecosystem/agentops) | [Langfuse](https://langfuse.com) (self-host) | [llmvcr](https://pypi.org/project/llmvcr/) |
+|---|---|---|---|---|---|---|
+| Runs fully local, no account | yes | yes | yes | no — API key + hosted dashboard | yes, but needs Postgres, ClickHouse, Redis and S3 ([source](https://blog.elest.io/self-host-langfuse-to-trace-your-ai-agents/)) | yes |
+| Install footprint | pure Python, 0 deps | Rust binary / pip SDK | part of LangGraph | SDK + cloud | multi-service stack | SDK + provider extras |
+| Framework-agnostic | yes (explicit hooks) | proxy or wrappers | LangGraph only | integrations | SDKs/OTel | provider SDKs |
+| Step diff of two runs | yes, sequence-aligned + first divergence | yes | — | — | — | — |
+| Fork from a step | yes (playback or live) | yes (cached replay) | yes (checkpoints) | yes ("time travel") | — | — |
+| CI regression gate | `redbg check` | yes (baseline + GitHub Action) | — | — | — | replay tests |
+| Loop detection | consecutive identical calls | — | — | "recursive thought detection" | — | — |
+| Auto-instrumentation | **no** | yes (OpenAI Agents SDK, Pydantic AI) | built in | unverified | unverified | yes (patches provider SDKs) |
+| Web UI | **no** | yes | unverified | yes (hosted dashboard) | yes | no (CLI) |
+
+"—" means the page we checked didn't mention it, not that it can't be done.
+Where redbg is weaker: no auto-instrumentation, no web UI, no LLM-judge
+scoring (rewind has these). Where it aims to be stronger: nothing to run
+or sign up for, a plain JSONL format you can grep, and a diff that tells
+you the *first* step that diverged.
 
 ## Roadmap (v2, not promised)
 

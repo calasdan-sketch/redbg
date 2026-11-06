@@ -25,6 +25,7 @@ from __future__ import annotations
 import functools
 import gzip
 import hashlib
+import inspect
 import json
 import threading
 import uuid
@@ -35,11 +36,13 @@ from .redact import (
     redact_event,
 )
 from .schema import (
+    MAX_NESTING,
     NOTE,
     PROMPT,
     RESPONSE,
     SESSION_END,
     SESSION_START,
+    TOO_DEEP,
     TOOL_CALL,
     TOOL_RESULT,
     new_event,
@@ -48,18 +51,26 @@ from .schema import (
 DEFAULT_MAX_OUTPUT_CHARS = 20_000
 
 
-def _json_safe(obj):
+def _json_safe(obj, _depth: int = 0):
     """Coerce anything into JSON-serializable form; never raises."""
-    try:
-        json.dumps(obj)
-        return obj
-    except (TypeError, ValueError):
-        pass
+    if _depth > MAX_NESTING:
+        return TOO_DEEP
+    if _depth == 0:
+        try:
+            json.dumps(obj)
+            return obj
+        except (TypeError, ValueError, RecursionError):
+            pass
     if isinstance(obj, dict):
-        return {str(k): _json_safe(v) for k, v in obj.items()}
+        return {str(k): _json_safe(v, _depth + 1) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
-        return [_json_safe(v) for v in obj]
-    return repr(obj)
+        return [_json_safe(v, _depth + 1) for v in obj]
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    try:
+        return repr(obj)
+    except Exception:  # noqa: BLE001 - a broken __repr__ must not kill recording
+        return f"<unrepresentable {type(obj).__name__}>"
 
 
 def _sha256_hex(text: str) -> str:
@@ -149,8 +160,10 @@ class Recorder:
             )
         return text, digest
 
-    def _truncate_deep(self, obj):
+    def _truncate_deep(self, obj, _depth: int = 0):
         """Truncate long strings anywhere inside args (anti-blowup)."""
+        if _depth > MAX_NESTING:
+            return TOO_DEEP
         if isinstance(obj, str):
             if self.max_output_chars >= 0 and len(obj) > self.max_output_chars:
                 return (
@@ -160,9 +173,9 @@ class Recorder:
                 )
             return obj
         if isinstance(obj, dict):
-            return {k: self._truncate_deep(v) for k, v in obj.items()}
+            return {k: self._truncate_deep(v, _depth + 1) for k, v in obj.items()}
         if isinstance(obj, (list, tuple)):
-            return [self._truncate_deep(v) for v in obj]
+            return [self._truncate_deep(v, _depth + 1) for v in obj]
         return obj
 
     # -- public API -----------------------------------------------------
@@ -248,11 +261,58 @@ class Recorder:
 
         Can be used bare (``@rec.wrap``) or with a name
         (``@rec.wrap(name="read_file")``). Exceptions are recorded as
-        failed results and re-raised.
+        failed results and re-raised. ``async def`` tools are supported:
+        the call is recorded when awaited, and the result is the awaited
+        value (not the coroutine object) — including callable objects with
+        an ``async def __call__``. Cancellation is recorded as a failed
+        result and re-raised.
+
+        Generator functions (sync or async) are rejected with ``TypeError``:
+        a wrapper can only see the generator object, not the values it will
+        yield. Wrap the function that consumes the generator instead.
         """
 
         def decorator(fn):
-            tool = name or fn.__name__
+            tool = name or getattr(fn, "__name__", None) or type(fn).__name__
+            call = type(fn).__call__ if callable(fn) else None
+
+            if (
+                inspect.isasyncgenfunction(fn)
+                or inspect.isgeneratorfunction(fn)
+                or (
+                    not inspect.isfunction(fn)
+                    and (
+                        inspect.isasyncgenfunction(call)
+                        or inspect.isgeneratorfunction(call)
+                    )
+                )
+            ):
+                raise TypeError(
+                    f"rec.wrap cannot record generator function {tool!r}: it would "
+                    "only see the generator object, not the yielded values. Wrap "
+                    "the function that consumes it, or record with "
+                    "tool_call()/tool_result()."
+                )
+
+            if inspect.iscoroutinefunction(fn) or (
+                not inspect.isfunction(fn) and inspect.iscoroutinefunction(call)
+            ):
+
+                @functools.wraps(fn)
+                async def ainner(*args, **kwargs):
+                    payload = {"args": list(args), "kwargs": kwargs}
+                    call_id = self.tool_call(tool, payload)
+                    try:
+                        result = await fn(*args, **kwargs)
+                    except BaseException as exc:  # incl. CancelledError
+                        self.tool_result(
+                            call_id, ok=False, error=f"{type(exc).__name__}: {exc}"
+                        )
+                        raise
+                    self.tool_result(call_id, ok=True, output=result)
+                    return result
+
+                return ainner
 
             @functools.wraps(fn)
             def inner(*args, **kwargs):

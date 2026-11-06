@@ -13,6 +13,13 @@ from datetime import datetime, timezone
 
 SCHEMA_VERSION = 1
 
+# Nesting depth past which redbg stops walking a value. Deeper subtrees are
+# replaced by a marker (or, when redacting, by [REDACTED] — what can't be
+# inspected can't be shared). Keeps every recursive walk far below Python's
+# recursion limit, including on 3.9 where comprehensions add frames.
+MAX_NESTING = 100
+TOO_DEEP = "[redbg: nested too deeply]"
+
 SESSION_START = "session_start"
 PROMPT = "prompt"
 RESPONSE = "response"

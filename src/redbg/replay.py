@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 from dataclasses import dataclass, field
 
 from .schema import (
@@ -31,6 +32,27 @@ def open_trace(path: str):
     return open(path, encoding="utf-8")
 
 
+def ensure_distinct(src: str, dst: str) -> None:
+    """Refuse to write ``dst`` when it is the same file as ``src``.
+
+    Opening the output for writing truncates it before the input is read,
+    so ``redbg redact t.jsonl -o t.jsonl`` would silently destroy the
+    trace. Catches symlinks, hard links and differently-spelled paths.
+    """
+    same = False
+    try:
+        same = os.path.samefile(src, dst)
+    except OSError:  # dst doesn't exist yet (the normal case), or src missing
+        same = os.path.normcase(os.path.realpath(src)) == os.path.normcase(
+            os.path.realpath(dst)
+        )
+    if same:
+        raise ValueError(
+            f"refusing to overwrite the input file {src!r}: "
+            "write to a different output path"
+        )
+
+
 def load_events(path: str, skip_bad: bool = False) -> list[dict]:
     """Read every event from a JSONL trace.
 
@@ -47,11 +69,14 @@ def load_events(path: str, skip_bad: bool = False) -> list[dict]:
                 continue
             try:
                 event = json.loads(stripped)
-            except json.JSONDecodeError as exc:
+            except (json.JSONDecodeError, RecursionError) as exc:
                 if not skip_bad:
-                    raise ValueError(
-                        f"{path}:{line_no}: malformed JSON: {exc}"
-                    ) from exc
+                    reason = (
+                        "nested too deeply"
+                        if isinstance(exc, RecursionError)
+                        else f"malformed JSON: {exc}"
+                    )
+                    raise ValueError(f"{path}:{line_no}: {reason}") from None
                 skipped += 1
                 continue
             # Unknown event types are preserved (forward-compat) — the
@@ -87,11 +112,12 @@ class Step:
 
     @property
     def tool(self) -> str:
-        if self.call:
-            return self.call.get("tool", "unknown")
-        if self.result:
-            return self.result.get("tool", "unknown")
-        return "unknown"
+        """Tool name, always a ``str`` (traces may hold ``123`` or ``null``)."""
+        source = self.call or self.result or {}
+        tool = source.get("tool")
+        if tool is None:
+            return "unknown"
+        return tool if isinstance(tool, str) else str(tool)
 
     @property
     def args(self) -> dict:

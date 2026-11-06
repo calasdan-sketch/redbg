@@ -18,7 +18,9 @@ import difflib
 import json
 from dataclasses import dataclass
 
+from ._text import clean
 from .replay import Session, Step
+from .schema import MAX_NESTING, TOO_DEEP
 
 # Step classifications in the side-by-side table.
 SAME = "same"
@@ -27,11 +29,54 @@ TOOL_CHANGED = "tool_changed"
 STATUS_CHANGED = "status_changed"
 ADDED = "added"
 REMOVED = "removed"
+# Not an alignment kind: a SAME/STATUS_CHANGED row whose recorded outputs
+# differ. Only used by ``redbg check --fail-on output_changed``.
+OUTPUT_CHANGED = "output_changed"
+
+ALL_KINDS = (SAME, ARGS_CHANGED, TOOL_CHANGED, STATUS_CHANGED, ADDED, REMOVED)
+CHANGE_KINDS = (ARGS_CHANGED, TOOL_CHANGED, STATUS_CHANGED, ADDED, REMOVED)
+
+# Recursion guard for pathological (very deeply nested) args. Anything
+# deeper is replaced by a constant marker — never ``repr`` it, which would
+# itself recurse through the remaining levels.
+_MAX_DEPTH = MAX_NESTING
 
 
-def step_signature(step: Step) -> tuple[str, str]:
-    args_json = json.dumps(step.args, sort_keys=True, default=str, ensure_ascii=False)
-    return (step.tool, args_json)
+def normalize_args(args, ignore_keys=frozenset(), _depth: int = 0):
+    """Canonicalize args for comparison.
+
+    - keys named in ``ignore_keys`` are dropped at any depth (use for
+      request ids, timestamps, nonces that differ on every run);
+    - integral floats compare equal to ints (``1.0`` == ``1``), matching
+      JSON's single number type. Booleans are never coerced.
+    """
+    if _depth > _MAX_DEPTH:
+        return TOO_DEEP
+    if isinstance(args, dict):
+        return {
+            str(k): normalize_args(v, ignore_keys, _depth + 1)
+            for k, v in args.items()
+            if str(k) not in ignore_keys
+        }
+    if isinstance(args, (list, tuple)):
+        return [normalize_args(v, ignore_keys, _depth + 1) for v in args]
+    if isinstance(args, float) and args.is_integer():
+        return int(args)
+    return args
+
+
+def _canonical(args, ignore_keys=frozenset(), indent=None) -> str:
+    return json.dumps(
+        normalize_args(args, ignore_keys),
+        sort_keys=True,
+        default=str,
+        ensure_ascii=False,
+        indent=indent,
+    )
+
+
+def step_signature(step: Step, ignore_keys=frozenset()) -> tuple[str, str]:
+    return (step.tool, _canonical(step.args, frozenset(ignore_keys)))
 
 
 @dataclass
@@ -52,9 +97,10 @@ class Divergence:
     detail: str = ""
 
 
-def align_steps(a: Session, b: Session) -> list[AlignedRow]:
-    sig_a = [step_signature(s) for s in a.steps]
-    sig_b = [step_signature(s) for s in b.steps]
+def align_steps(a: Session, b: Session, ignore_keys=()) -> list[AlignedRow]:
+    ignore = frozenset(ignore_keys)
+    sig_a = [step_signature(s, ignore) for s in a.steps]
+    sig_b = [step_signature(s, ignore) for s in b.steps]
     matcher = difflib.SequenceMatcher(None, sig_a, sig_b, autojunk=False)
     rows: list[AlignedRow] = []
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
@@ -90,9 +136,13 @@ def align_steps(a: Session, b: Session) -> list[AlignedRow]:
     return rows
 
 
-def _describe_args_change(a_step: Step, b_step: Step) -> str:
-    a_args = json.dumps(a_step.args, sort_keys=True, indent=2, default=str)
-    b_args = json.dumps(b_step.args, sort_keys=True, indent=2, default=str)
+def _describe_args_change(
+    a_step: Step, b_step: Step, ignore_keys=frozenset()
+) -> tuple[str, list[str]]:
+    a_norm = normalize_args(a_step.args, ignore_keys)
+    b_norm = normalize_args(b_step.args, ignore_keys)
+    a_args = _canonical(a_step.args, ignore_keys, indent=2)
+    b_args = _canonical(b_step.args, ignore_keys, indent=2)
     diff = list(
         difflib.unified_diff(
             a_args.splitlines(),
@@ -102,30 +152,30 @@ def _describe_args_change(a_step: Step, b_step: Step) -> str:
             lineterm="",
         )
     )
-    changed_keys = sorted(
-        set(a_step.args) ^ set(b_step.args)
-        | {
-            k
-            for k in a_step.args
-            if k in b_step.args and a_step.args[k] != b_step.args[k]
-        }
-    )
+    if isinstance(a_norm, dict) and isinstance(b_norm, dict):
+        changed_keys = sorted(
+            set(a_norm) ^ set(b_norm)
+            | {k for k in a_norm if k in b_norm and a_norm[k] != b_norm[k]}
+        )
+    else:  # args recorded as a non-object (list/scalar): no key names
+        changed_keys = []
     detail = "\n".join(diff) if diff else "(no textual diff; ordering only)"
     return detail, changed_keys
 
 
 def find_divergence(
-    a: Session, b: Session, rows: list[AlignedRow] | None = None
+    a: Session, b: Session, rows: list[AlignedRow] | None = None, ignore_keys=()
 ) -> Divergence | None:
     """Return the first divergence, or None if the runs are identical."""
-    rows = rows if rows is not None else align_steps(a, b)
+    ignore = frozenset(ignore_keys)
+    rows = rows if rows is not None else align_steps(a, b, ignore)
     for row in rows:
         if row.kind == SAME:
             continue
         a_n = f"A:{row.a_n}" if row.a_n is not None else "A:—"
         b_n = f"B:{row.b_n}" if row.b_n is not None else "B:—"
         if row.kind == ARGS_CHANGED and row.a_step and row.b_step:
-            detail, changed = _describe_args_change(row.a_step, row.b_step)
+            detail, changed = _describe_args_change(row.a_step, row.b_step, ignore)
             keys = ", ".join(changed) if changed else "args"
             return Divergence(
                 row.a_n,
@@ -212,8 +262,8 @@ def _color(text: str, code: str, use_color: bool) -> str:
     return text
 
 
-def _short_args(step: Step, width: int) -> str:
-    args = json.dumps(step.args, sort_keys=True, default=str, ensure_ascii=False)
+def _short_args(step: Step, width: int, ignore_keys=frozenset()) -> str:
+    args = _canonical(step.args, ignore_keys)
     if len(args) > width:
         args = args[: width - 1] + "…"
     return args
@@ -238,10 +288,16 @@ def render_diff(
     use_color: bool = True,
     context: int = 2,
     args_width: int = 44,
+    ignore_keys=(),
 ) -> str:
-    """Render the full diff report: headline, table, field diff, summary."""
-    rows = align_steps(a, b)
-    div = find_divergence(a, b, rows)
+    """Render the full diff report: headline, table, field diff, summary.
+
+    All trace-derived text is passed through ``clean`` so a crafted trace
+    can't inject terminal control sequences into the report.
+    """
+    ignore = frozenset(ignore_keys)
+    rows = align_steps(a, b, ignore)
+    div = find_divergence(a, b, rows, ignore)
     lines: list[str] = []
 
     # Headline.
@@ -255,7 +311,7 @@ def render_diff(
             )
         )
     else:
-        lines.append(_color("✗ " + div.headline, _BOLD + "\033[31m", use_color))
+        lines.append(_color("✗ " + clean(div.headline), _BOLD + "\033[31m", use_color))
     lines.append("")
 
     # Side-by-side table.
@@ -271,13 +327,14 @@ def render_diff(
         )
         if row.kind == TOOL_CHANGED and row.a_step and row.b_step:
             tool_cell = f"{row.a_step.tool} → {row.b_step.tool}"
+        tool_cell = clean(tool_cell)
         note = label
         if row.kind in (SAME, ARGS_CHANGED, STATUS_CHANGED):
             result_note = _result_note(row.a_step, row.b_step)
             if result_note:
                 note = f"{label + '; ' if label else ''}{result_note}"
             if row.kind == ARGS_CHANGED and row.a_step:
-                note += f"  {_short_args(row.a_step, args_width)}"
+                note += f"  {clean(_short_args(row.a_step, args_width, ignore))}"
         line = f"{a_n:>5}  {b_n:>5}  {mark}  {tool_cell:<28}  {note}"
         lines.append(_color(line, _COLORS[row.kind], use_color))
 
@@ -285,7 +342,7 @@ def render_diff(
     if div is not None and div.detail:
         lines.append("")
         lines.append(_color("── args diff at divergence ──", _BOLD, use_color))
-        lines.append(div.detail)
+        lines.append(clean(div.detail))
 
     # Summary.
     counts = {k: 0 for k in _KIND_MARK}
@@ -301,3 +358,105 @@ def render_diff(
     )
     lines.append(summary)
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Machine-readable diff
+# ---------------------------------------------------------------------------
+
+
+def _step_brief(step: Step | None) -> dict | None:
+    if step is None:
+        return None
+    return {
+        "n": step.n,
+        "tool": step.tool,
+        "ok": step.ok,
+        "output_sha256": step.output_sha256,
+    }
+
+
+def output_changed(row: AlignedRow) -> bool:
+    """True when both sides have a result and the recorded outputs differ."""
+    return _result_note(row.a_step, row.b_step) == "output DIFFERS"
+
+
+def diff_to_dict(a: Session, b: Session, ignore_keys=()) -> dict:
+    """The diff as plain data (what ``redbg diff --json`` prints).
+
+    Stable keys: ``identical``, ``divergence``, ``counts``, ``rows``. Each
+    row has ``kind``, ``a``/``b`` step briefs (or null for a gap), and
+    ``output_changed``.
+    """
+    ignore = frozenset(ignore_keys)
+    rows = align_steps(a, b, ignore)
+    div = find_divergence(a, b, rows, ignore)
+    counts = {k: 0 for k in ALL_KINDS}
+    for row in rows:
+        counts[row.kind] += 1
+    return {
+        "a": {"path": a.path, "steps": len(a.steps)},
+        "b": {"path": b.path, "steps": len(b.steps)},
+        "identical": div is None,
+        "divergence": None
+        if div is None
+        else {
+            "a_n": div.a_n,
+            "b_n": div.b_n,
+            "kind": div.kind,
+            "headline": div.headline,
+            "detail": div.detail,
+        },
+        "counts": counts,
+        "rows": [
+            {
+                "kind": row.kind,
+                "a": _step_brief(row.a_step),
+                "b": _step_brief(row.b_step),
+                "output_changed": output_changed(row),
+            }
+            for row in rows
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Loop detection
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Repeat:
+    """A run of consecutive steps with identical tool + args."""
+
+    tool: str
+    first: int
+    last: int
+
+    @property
+    def count(self) -> int:
+        return self.last - self.first + 1
+
+
+def find_repeats(session: Session, min_count: int = 2, ignore_keys=()) -> list[Repeat]:
+    """Find runs of >= ``min_count`` consecutive identical tool calls.
+
+    An agent calling the same tool with the same args back-to-back is the
+    most common shape of a stuck loop. Retries after a failure are also
+    caught — which is usually what you want to see.
+    """
+    ignore = frozenset(ignore_keys)
+    runs: list[Repeat] = []
+    prev_sig = None
+    start = None
+    steps = session.steps
+    for i, step in enumerate(steps):
+        sig = step_signature(step, ignore)
+        if sig != prev_sig:
+            if start is not None and i - start >= min_count:
+                runs.append(Repeat(steps[start].tool, steps[start].n, steps[i - 1].n))
+            start = i
+            prev_sig = sig
+    if start is not None and len(steps) - start >= min_count:
+        runs.append(Repeat(steps[start].tool, steps[start].n, steps[-1].n))
+    return runs

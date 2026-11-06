@@ -215,7 +215,7 @@ def test_fork_resolves_step_positionally_not_by_file_field(tmp_path):
 
 
 def test_live_fork_warns_when_model_makes_no_calls(tmp_path):
-    from tests.conftest import record_session
+    from conftest import record_session
 
     path = record_session(str(tmp_path / "s.jsonl"))
     session = Session.load(path)
