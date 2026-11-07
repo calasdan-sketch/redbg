@@ -13,12 +13,14 @@ interpreter start-up, i.e. what a user waits for before seeing step 1.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 
@@ -89,8 +91,15 @@ def run(args, work) -> None:
     if args.baseline:
         base = os.path.join(work, "baseline")
         os.makedirs(base)
-        subprocess.run(f"git -C {ROOT} archive {args.baseline} src | tar -x -C {base}",
-                       shell=True, check=True)
+        archive = subprocess.run(
+            ["git", "-C", ROOT, "archive", "--format=tar", args.baseline, "src"],
+            check=True, capture_output=True,
+        ).stdout
+        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+            try:
+                tar.extractall(base, filter="data")
+            except TypeError:  # Python without extraction filters
+                tar.extractall(base)  # noqa: S202 - our own repo's archive
         targets[args.baseline] = os.path.join(base, "src")
 
     rows = []
@@ -133,7 +142,7 @@ def run(args, work) -> None:
             f"| {label} | {name} | {info['bytes'] / 1e6:.0f} | {info['steps']} | "
             f"{fmt(res['load_s']) if res else 'cannot open'} | "
             f"{fmt(res['rss_mb'], 'MB', 0) if res else '-'} | {fmt(ttfv)} | "
-            f"{fmt(why) if label == 'current' else '-'} | "
+            f"{fmt(why) if why is not None else '-'} | "
             f"{fmt(aud) if aud is not None else '-'} | "
             f"{fmt(chk) if chk is not None else '-'} |"
         )

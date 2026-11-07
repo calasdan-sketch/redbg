@@ -29,6 +29,7 @@ import inspect
 import json
 import threading
 import uuid
+from typing import IO, Literal
 
 from .redact import (
     DEFAULT_KEY_RE,
@@ -99,7 +100,7 @@ class Recorder:
         self.key_re = key_re
         self.value_res = value_res if value_res is not None else DEFAULT_VALUE_RES
         self._lock = threading.RLock()
-        self._handle = None
+        self._handle: IO[str] | None = None
         self._step = 0
         self._pending: dict[str, int] = {}  # call_id -> step number
         self._tool_names: dict[str, str] = {}  # call_id -> tool name
@@ -109,9 +110,9 @@ class Recorder:
     # -- lifecycle ------------------------------------------------------
     def __enter__(self) -> Recorder:
         if self.path.endswith(".gz"):
-            self._handle = gzip.open(self.path, "wt", encoding="utf-8")
+            self._handle = gzip.open(self.path, "wt", encoding="utf-8", newline="\n")
         else:
-            self._handle = open(self.path, "w", encoding="utf-8")
+            self._handle = open(self.path, "w", encoding="utf-8", newline="\n")
         self._write(
             new_event(
                 SESSION_START,
@@ -122,7 +123,7 @@ class Recorder:
         )
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
+    def __exit__(self, exc_type, exc, tb) -> Literal[False]:
         status = "ok" if exc_type is None else "error"
         fields: dict = {
             "session_id": self.session_id,

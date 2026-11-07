@@ -18,8 +18,10 @@ from __future__ import annotations
 import functools
 import gzip
 import json
+import os
 import re
 
+from ._fs import finish, name_target, staging_path
 from .replay import ensure_distinct, open_trace
 from .schema import MAX_NESTING
 
@@ -52,7 +54,7 @@ _STRONG_KEY_RE = re.compile(
 )
 _DIGITS_RE = re.compile(r"\d{1,15}")
 # Free-text keys that merely look sensitive: the shell's working-directory
-# variables in env dumps (``PWD=/home/dan``). ``DB_PWD=`` is still redacted.
+# variables in env dumps (``PWD=/home/alice``). ``DB_PWD=`` is still redacted.
 _BENIGN_ASSIGN_KEY_RE = re.compile(r"(?i)(?:old)?pwd")
 
 # The value side of a ``KEY=value`` / ``KEY: value`` / ``?key=value`` line.
@@ -476,20 +478,33 @@ def redact_file(
     total_redactions = 0
     events = 0
     opener = gzip.open if dst.endswith(".gz") else open
-    with open_trace(src) as handle, opener(dst, "wt", encoding="utf-8") as out:
-        for handle_line, line in enumerate(handle, start=1):
-            stripped = line.strip()
-            if not stripped:
-                continue
-            try:
-                event = json.loads(stripped)
-            except (json.JSONDecodeError, RecursionError) as exc:
-                raise ValueError(
-                    f"{src}:{handle_line}: not a JSONL trace line ({exc}); "
-                    "for other log formats use `redbg import SRC -o OUT --redact`"
-                ) from None
-            redacted, n = redact_event(event, key_re, value_res)
-            total_redactions += n
-            events += 1
-            out.write(json.dumps(redacted) + "\n")
+    # Write beside the target and move it into place only when complete: a
+    # bad line half-way (or a full disk) must not leave a truncated trace
+    # at ``dst`` that later looks like a valid, shorter session.
+    tmp = staging_path(dst)
+    try:
+        with open_trace(src) as handle, opener(
+            tmp, "wt", encoding="utf-8", newline="\n"
+        ) as out:
+            for handle_line, line in enumerate(handle, start=1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    event = json.loads(stripped)
+                except (json.JSONDecodeError, RecursionError) as exc:
+                    raise ValueError(
+                        f"{src}:{handle_line}: not a JSONL trace line ({exc}); "
+                        "for other log formats use `redbg import SRC -o OUT --redact`"
+                    ) from None
+                redacted, n = redact_event(event, key_re, value_res)
+                total_redactions += n
+                events += 1
+                out.write(json.dumps(redacted) + "\n")
+        finish(tmp, dst)
+    except OSError as exc:
+        raise name_target(exc, tmp, dst) from None
+    finally:
+        if tmp != dst and os.path.exists(tmp):
+            os.remove(tmp)
     return {"events": events, "redactions": total_redactions, "dst": dst}

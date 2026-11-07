@@ -235,12 +235,12 @@ def run_check(
                 )
                 if hit:
                     how = "inferred from a shell command" if eff.how == "inferred" else "declared"
-                    failed = " (the step failed, but it tried)" if step.ok is False else ""
+                    tried = " (the step failed, but it tried)" if step.ok is False else ""
                     violations.append(
                         Violation(
                             "forbid_paths",
                             f"step {step.n} ({step.tool}) {eff.kind}s {eff.path!r} "
-                            f"(matches {hit!r}; {how}){failed}",
+                            f"(matches {hit!r}; {how}){tried}",
                             step.n,
                         )
                     )
@@ -321,7 +321,7 @@ def run_check(
         div = find_divergence(baseline, candidate, rows, rules.ignore_keys)
         regressions = 0
         for row in rows:
-            kinds = []
+            kinds: list[str] = []
             if row.kind in fail_on:
                 kinds.append(row.kind)
             if OUTPUT_CHANGED in fail_on and output_changed(row):
@@ -329,7 +329,8 @@ def run_check(
             for kind in kinds:
                 regressions += 1
                 where = f"baseline:{row.a_n or '—'} / candidate:{row.b_n or '—'}"
-                tool = (row.b_step or row.a_step).tool
+                step_ = row.b_step or row.a_step
+                tool = step_.tool if step_ is not None else "?"
                 violations.append(Violation(kind, f"{where} {tool!r}: {kind}", row.b_n))
         if regressions and div is not None and div.kind in fail_on:
             # Put the human headline first: it is the single most useful line.

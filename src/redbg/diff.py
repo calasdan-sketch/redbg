@@ -113,6 +113,7 @@ def align_steps(a: Session, b: Session, ignore_keys=()) -> list[AlignedRow]:
     while tail < na - head and tail < nb - head and sig_a[na - 1 - tail] == sig_b[nb - 1 - tail]:
         tail += 1
     ops: list[tuple[str, int, int, int, int]] = []
+    tag: str
     if head:
         ops.append(("equal", 0, head, 0, head))
     if head < na - tail or head < nb - tail:
@@ -124,7 +125,7 @@ def align_steps(a: Session, b: Session, ignore_keys=()) -> list[AlignedRow]:
     if tail:
         ops.append(("equal", na - tail, na, nb - tail, nb))
     rows: list[AlignedRow] = []
-    for tag, i1, i2, j1, j2 in ops:
+    for tag, i1, i2, j1, j2 in ops:  # tag is str here (opcodes widen the Literal)
         if tag == "equal":
             for i, j in zip(range(i1, i2), range(j1, j2)):
                 sa, sb = a.steps[i], b.steps[j]

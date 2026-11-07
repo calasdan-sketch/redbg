@@ -102,25 +102,38 @@ never leave half a private key behind.
 
 ```bash
 pip install redbg
+redbg --version          # also works as: python -m redbg --version
 ```
 
-Python 3.9+. No runtime dependencies — it installs anywhere.
+Python 3.9+ (tested on 3.9, 3.11, 3.12 and 3.13 on Linux). No runtime
+dependencies, so it installs anywhere. Not yet run on Windows or macOS by the
+author (see "Windows" below).
 
-**Try it in 30 seconds** (from a clone of this repo; uses the two sample
-traces in `examples/`):
+**Try it in 30 seconds** (nothing to clone; `redbg demo` writes two small
+example traces):
 
 ```bash
-redbg diff  examples/sample-a.jsonl examples/sample-b.jsonl
-redbg check examples/sample-b.jsonl --baseline examples/sample-a.jsonl; echo "exit=$?"
+redbg demo                      # writes ./redbg-demo/sample-a.jsonl and sample-b.jsonl
+redbg diff  redbg-demo/sample-a.jsonl redbg-demo/sample-b.jsonl
+redbg check redbg-demo/sample-b.jsonl --baseline redbg-demo/sample-a.jsonl; echo "exit=$?"
 ```
 
 ```
-✗ check FAILED: examples/sample-b.jsonl vs baseline examples/sample-a.jsonl
+✗ check FAILED: redbg-demo/sample-b.jsonl vs baseline redbg-demo/sample-a.jsonl
   [divergence] First divergence at A:— / B:1: step added in B ('read_file')
   [added] baseline:— / candidate:1 'read_file': added
   rules: non_empty, complete, baseline
 exit=1
 ```
+
+Have Claude Code or Codex on this machine? `redbg sessions` lists your recent
+transcripts (newest first); then `redbg audit PATH`.
+
+**Exit codes** (every command): `0` fine, `1` problems found (`check`, `scan`,
+`audit --strict`), `2` could not run (bad input, bad option, unwritable
+output; never a traceback), `141` the output pipe was closed (`| head`),
+`130` interrupted. An unexpected crash is also `2`, so CI never reads a bug
+in redbg as "your agent broke a rule"; `REDBG_DEBUG=1` shows the traceback.
 
 ## Quickstart
 
@@ -174,6 +187,9 @@ $ redbg replay session.jsonl
 ```
 
 Non-interactive: `--list`, `--show N`, `--cmd "n;n;s"`, `--export-md report.md`.
+
+`Recorder(path)` creates the file fresh: recording to a path that exists
+replaces the old trace, so give each run its own file name.
 
 **3. Diff.** Find where two runs diverged:
 
@@ -385,6 +401,17 @@ at 20,000 chars (configurable via `max_output_chars`) with a SHA-256 of the
 full output retained so diffs still detect changes. Run `redbg scan`
 before sharing any trace, and `redbg redact` to clean one.
 
+## Windows
+
+Written to be portable: no shell calls, no signals, no POSIX-only modules in
+the package; files are written with `\n` line endings and read in any of
+UTF-8/UTF-16/UTF-32 or CRLF; `os.replace` onto a file another program has
+open is retried briefly; a console or redirect that cannot show a character
+(cp1252, ASCII) prints it as `\uXXXX` instead of crashing; colors are used
+only when the console accepts them. **Nobody has run it on Windows** (the
+test suite and a static review were done on Linux): if something breaks
+there, open an issue. `bench/bench.py` is POSIX-only.
+
 ## Limitations (honest)
 
 - **Playback forks don't model the model.** Replaying recorded model text
@@ -456,10 +483,13 @@ Only statements we could check against each project's own page are listed.
 
 "—" means the page we checked didn't mention it, not that it can't be done.
 The rewind column was re-read this round from its PyPI page only (its
-repository link was not reachable from our build environment). The
+repository link was not reachable from our build environment); the page
+still says 0.17.1 and that the native binary downloads on first use. The
 [claude-code-log](https://pypi.org/project/claude-code-log/) PyPI page (1.7.0)
 adds a terminal UI and per-session cost questions to its HTML export; redbg
-counts tokens but does not price them.
+counts tokens but does not price them. Its PyPI metadata (read
+2026-11-07) requires Python 3.10+ and installs click, dateparser, gitpython,
+jinja2, pydantic and others; redbg needs Python 3.9+ and nothing else.
 Where redbg is weaker: no auto-instrumentation, no web UI, no LLM-judge
 scoring (rewind's earlier-read repo listed these; not re-checked). Where it aims to be stronger: nothing to run
 or sign up for, a plain JSONL format you can grep, and a diff that tells
@@ -473,7 +503,7 @@ host). Peak memory is the process's maximum resident size.
 
 | | what it does | 100 MB synthetic transcript | 7 MB real transcript |
 |---|---|---|---|
-| **redbg 0.3** | interactive debugger | first step on screen in **0.07-0.10 s** on a quiet host (0.25-0.40 s when the host's load average was ~10); full load 1.4 s quiet / 3.3 s loaded, 108 MB | first step 0.07 s, 19 MB |
+| **redbg 0.3** | interactive debugger | first step on screen in **0.07-0.10 s** on a quiet host (0.25-0.40 s when the host's load average was ~10); full load 1.4 s quiet / 3.3 s loaded, 108 MB (re-measured in round 4 at load ~9: 0.27-0.44 s and 1.9-3.1 s, same memory; indistinguishable from the previous commit run side by side, see `bench/RESULTS.md`) | first step 0.07 s, 19 MB |
 | redbg 0.2 (before) | interactive debugger | cannot open (rejects the format) | cannot open |
 | [claude-code-transcripts](https://pypi.org/project/claude-code-transcripts/) 0.6 (`json`) | static HTML pages | 6.2 s, 267 MB, writes 88 MB of HTML | 0.4 s, 49 MB |
 | [claude-code-log](https://pypi.org/project/claude-code-log/) 1.7.0 | static HTML/Markdown | not run: its strict validation rejected our synthetic attachment lines | 1.7 s, 94 MB |

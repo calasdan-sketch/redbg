@@ -173,7 +173,7 @@ def sniff(path: str) -> str:
             if kind:
                 votes[kind] = votes.get(kind, 0) + 1
     if votes:
-        return max(votes, key=votes.get)
+        return max(votes, key=lambda k: votes[k])
     if first_char == "{":
         # A pretty-printed single JSON document (first line is just "{").
         try:
@@ -719,7 +719,7 @@ def iter_messages(path, builder: _Builder, state: dict):
             for tc in msg.get("tool_calls") or []:
                 if not isinstance(tc, dict):
                     continue
-                fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                fn = tc["function"] if isinstance(tc.get("function"), dict) else {}
                 cid = tc.get("id") or f"call_{i}_{builder.step + 1}"
                 yield builder.call(
                     str(cid), fn.get("name") or tc.get("name"),

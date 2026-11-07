@@ -23,7 +23,7 @@ import json
 import sys
 import uuid
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Any, Callable
 
 from .schema import (
     NOTE,
@@ -86,7 +86,7 @@ class ForkedSession:
         import gzip
 
         opener = gzip.open if path.endswith(".gz") else open
-        with opener(path, "wt", encoding="utf-8") as handle:
+        with opener(path, "wt", encoding="utf-8", newline="\n") as handle:
             for event in self.events:
                 handle.write(json.dumps(event, default=str) + "\n")
 
@@ -199,7 +199,7 @@ def _note_override_no_effect(
 
 def _renumber_history(history: list[dict]) -> None:
     """Rewrite step numbers in copied history events to 1..N densely."""
-    renumber: dict[str, int] = {}
+    renumber: dict[Any, int] = {}
     next_n = 0
     for event in history:
         if event.get("type") == TOOL_CALL:

@@ -1,22 +1,31 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "redbg"
 version = "0.3.0"
-description = "gdb for agent sessions: record, replay, diff, and fork tool-calling runs"
+description = "gdb for agent sessions: replay, audit, diff and CI-gate Claude Code, Codex and tool-calling agent runs"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
-authors = [{ name = "Calas Automations" }]
-keywords = ["agents", "debugging", "replay", "tracing", "llm"]
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Calas Automations Inc." }]
+keywords = ["agents", "debugging", "replay", "tracing", "llm", "claude-code", "codex", "ci"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
+  "Environment :: Console",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Software Development :: Debuggers",
+  "Topic :: Software Development :: Testing",
+  "Typing :: Typed",
 ]
 dependencies = []
 
@@ -25,9 +34,15 @@ redbg = "redbg.cli:main"
 
 [project.urls]
 Homepage = "https://calasautomations.com"
+Repository = "https://github.com/calasdan-sketch/redbg"
+Issues = "https://github.com/calasdan-sketch/redbg/issues"
+Changelog = "https://github.com/calasdan-sketch/redbg/blob/main/CHANGELOG.md"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+redbg = ["py.typed", "_samples/*.jsonl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -40,3 +55,7 @@ line-length = 88
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
 ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true

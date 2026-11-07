@@ -2,19 +2,11 @@
 
 Python 3.13.18 on Linux x86_64; best of 3 for time-to-first-view, single run for load. Re-run: `python bench/bench.py`.
 
-Host load average (1/5/15 min) at the end of the run: 10.7/11.2/11.1. Absolute times scale with it; compare rows within one table.
+Host load average (1/5/15 min) at the end of the run: 8.9/10.6/10.7. Absolute times scale with it; compare rows within one table.
 
 | version | input | file MB | steps | full load | peak memory | time to first view | `why` (mid-step) | `audit` | `check` vs itself |
 |---|---|---|---|---|---|---|---|---|---|
-| current | redbg native | 105 | 26643 | 2.66 s | 195 MB | 0.40 s | 2.93 s | 95.23 s | 6.82 s |
-| current | Claude Code | 105 | 14947 | 3.28 s | 108 MB | 0.25 s | 4.25 s | 55.99 s | 9.65 s |
-| b7d5254 | redbg native | 105 | 26643 | 2.21 s | 194 MB | 2.58 s | - | - | - |
-| b7d5254 | Claude Code | 105 | 14947 | cannot open | - | cannot open | - | - | - |
-
-Notes: `audit` includes the credential scan, which is most of its time
-(`audit --no-secrets` is several times faster). `check` is run against itself
-(`--baseline` = the same file, `--max-cycles 99`), the common CI case of an
-almost identical run; before round 3 that alignment alone took about half a
-minute on the native input on this host. The previous quiet-host run
-(load average ~1) measured full load 0.94 s / 1.41 s and time to first view
-0.10 s / 0.07 s for the same inputs.
+| current | redbg native | 105 | 26643 | 1.94 s | 195 MB | 0.27 s | 1.83 s | 62.61 s | 5.94 s |
+| current | Claude Code | 105 | 14947 | 3.14 s | 108 MB | 0.44 s | 4.38 s | 45.27 s | 5.86 s |
+| 6f8ad30 | redbg native | 105 | 26643 | 1.21 s | 195 MB | 0.12 s | 3.16 s | 79.25 s | 7.08 s |
+| 6f8ad30 | Claude Code | 105 | 14947 | 3.81 s | 108 MB | 0.41 s | 4.51 s | 34.61 s | 4.17 s |

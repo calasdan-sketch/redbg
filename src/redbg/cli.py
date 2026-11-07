@@ -1,6 +1,8 @@
 """redbg command-line interface.
 
 Subcommands:
+  demo [DIR]          write two example traces to try redbg on
+  sessions            list recent Claude Code / Codex transcripts
   replay TRACE        interactive debugger REPL (step next/prev, inspect)
   diff A B            side-by-side divergence report for two sessions
   check TRACE         CI gate: regressions vs --baseline, budgets, loops
@@ -30,8 +32,10 @@ import runpy
 import shutil
 import sys
 import tempfile
+from typing import Any
 
 from . import __version__
+from ._fs import explain_oserror
 from ._text import clean, md_fence
 from .analysis import Breakpoint, blame, explain, file_ledger, run_to_breakpoint
 from .audit import audit
@@ -52,8 +56,37 @@ CYAN = "\033[36m"
 RESET = "\033[0m"
 
 
+def _why_failed(exc: BaseException) -> str:
+    """Plain-English text for an error shown to the user."""
+    if isinstance(exc, OSError):
+        return explain_oserror(exc)
+    return str(exc)
+
+
+def _windows_ansi_ok() -> bool:
+    """True if this Windows console understands ANSI colors (tries to turn them on)."""
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x4
+        return bool(mode.value & 0x4) or bool(kernel32.SetConsoleMode(handle, mode.value | 0x4))
+    except Exception:  # noqa: BLE001 - any failure just means "no color"
+        return False
+
+
 def _color_enabled() -> bool:
-    return sys.stdout.isatty() and os.environ.get("NO_COLOR", "") == ""
+    if os.environ.get("NO_COLOR", "") != "" or not sys.stdout.isatty():
+        return False
+    if os.environ.get("TERM") == "dumb":
+        return False
+    if os.name == "nt":
+        return _windows_ansi_ok()
+    return True
 
 
 def _c(text: str, code: str, enabled: bool) -> str:
@@ -558,18 +591,18 @@ def cmd_replay(args) -> int:
             max_steps=_lazy_limit(args),
         )
     except (ValueError, OSError) as exc:
-        print(f"redbg: {exc}", file=sys.stderr)
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
         return 2
     color = _color_enabled() and not args.no_color
     if args.export_md:
-        with open(args.export_md, "w", encoding="utf-8") as handle:
+        with open(args.export_md, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(export_markdown(session))
         print(f"wrote {args.export_md}")
         return 0
     if args.export_html:
         if not args.redact and not args.no_redact_html:
             session = Session.load(args.trace, skip_bad=args.skip_bad, redact=True)
-        with open(args.export_html, "w", encoding="utf-8") as handle:
+        with open(args.export_html, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(render_html(session))
         note = "" if (args.redact or not args.no_redact_html) else " (NOT redacted)"
         print(f"wrote {args.export_html}{note}")
@@ -581,9 +614,10 @@ def cmd_replay(args) -> int:
         try:
             step = session.get_step(args.show)
         except IndexError as exc:
-            print(f"redbg: {exc}", file=sys.stderr)
+            print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
             return 2
-        print(render_step(step, "?" if session.partial else len(session.steps), color))
+        total: Any = "?" if session.partial else len(session.steps)
+        print(render_step(step, total, color))
         return 0
     Repl(session, color).run(script=args.cmd)
     return 0
@@ -593,7 +627,7 @@ def _load_or_fail(args, **kw):
     try:
         return Session.load(args.trace, skip_bad=args.skip_bad, **kw)
     except (ValueError, OSError) as exc:
-        print(f"redbg: {exc}", file=sys.stderr)
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
         return None
 
 
@@ -604,7 +638,7 @@ def cmd_why(args) -> int:
     try:
         exp = explain(session, args.step)
     except IndexError as exc:
-        print(f"redbg: {exc}", file=sys.stderr)
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
         return 2
     if args.json:
         print(
@@ -686,7 +720,7 @@ def cmd_diff(args) -> int:
         a = Session.load(args.a, skip_bad=args.skip_bad)
         b = Session.load(args.b, skip_bad=args.skip_bad)
     except (ValueError, OSError) as exc:
-        print(f"redbg: {exc}", file=sys.stderr)
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
         return 2
     ignore = _split_csv(args.ignore_keys)
     if args.json:
@@ -731,15 +765,15 @@ def cmd_check(args) -> int:
             **({"fail_on": fail_on} if fail_on else {}),
         )
     except (ValueError, OSError) as exc:
-        print(f"redbg: {exc}", file=sys.stderr)
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
         return 2
     result = run_check(candidate, rules, baseline)
     if args.junit:
         try:
-            with open(args.junit, "w", encoding="utf-8") as handle:
+            with open(args.junit, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(to_junit(result))
         except OSError as exc:
-            print(f"redbg: cannot write --junit report: {exc}", file=sys.stderr)
+            print(f"redbg: --junit report not written: {_why_failed(exc)}", file=sys.stderr)
             return 2
     if args.github:
         print(to_github(result, args.limit))
@@ -768,7 +802,16 @@ def cmd_check(args) -> int:
 
 
 def _load_tools_module(path: str) -> tuple[dict, object]:
-    namespace = runpy.run_path(path)
+    try:
+        namespace = runpy.run_path(path)
+    except (OSError, ValueError):
+        raise
+    except BaseException as exc:  # noqa: BLE001 - your file's own error, shown plainly
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        raise ValueError(
+            f"{path} failed while loading: {type(exc).__name__}: {exc}"
+        ) from None
     tools = namespace.get("TOOLS", {})
     if not isinstance(tools, dict):
         raise ValueError(f"{path}: TOOLS must be a dict of name -> callable")
@@ -782,7 +825,7 @@ def cmd_fork(args) -> int:
             ensure_distinct(args.trace, args.save)
         session = Session.load(args.trace, skip_bad=args.skip_bad)
     except (ValueError, OSError) as exc:
-        print(f"redbg: {exc}", file=sys.stderr)
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
         return 2
     override_args = None
     if args.override_args:
@@ -792,12 +835,12 @@ def cmd_fork(args) -> int:
             print(f"redbg: bad --override-args JSON: {exc}", file=sys.stderr)
             return 2
     tool_impls: dict = {}
-    model_fn = None
+    model_fn: Any = None
     if args.tools:
         try:
             tool_impls, model_fn = _load_tools_module(args.tools)
         except (OSError, ValueError) as exc:
-            print(f"redbg: {exc}", file=sys.stderr)
+            print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
             return 2
     spec = ForkSpec(
         at_step=args.at,
@@ -811,7 +854,7 @@ def cmd_fork(args) -> int:
     try:
         forked = fork_session(session, spec)
     except ValueError as exc:
-        print(f"redbg: {exc}", file=sys.stderr)
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
         return 2
     if args.save:
         forked.save(args.save)
@@ -837,7 +880,7 @@ def cmd_redact(args) -> int:
     try:
         stats = redact_file(args.src, args.dst, value_res=_value_res(args))
     except (ValueError, OSError) as exc:
-        print(f"redbg: {exc}", file=sys.stderr)
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
         return 2
     print(
         f"redacted {stats['redactions']} value(s) across "
@@ -850,7 +893,7 @@ def cmd_scan(args) -> int:
     try:
         findings = scan_file(args.trace, value_res=_value_res(args))
     except (ValueError, OSError) as exc:
-        print(f"redbg: {exc}", file=sys.stderr)
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
         return 2
     if not findings:
         print("scan clean: no likely secrets found.")
@@ -897,7 +940,7 @@ def cmd_info(args) -> int:
     try:
         session = Session.load(args.trace, skip_bad=args.skip_bad)
     except (ValueError, OSError) as exc:
-        print(f"redbg: {exc}", file=sys.stderr)
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
         return 2
     if args.json:
         print(json.dumps(info_to_dict(session), indent=2, default=str))
@@ -910,7 +953,7 @@ def cmd_import(args) -> int:
     try:
         stats = import_file(args.src, args.dst, redact=args.redact)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"redbg: {exc}", file=sys.stderr)
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
         return 2
     print(
         f"imported {stats['steps']} tool steps "
@@ -920,6 +963,113 @@ def cmd_import(args) -> int:
         print("note: OTel import is heuristic and lossy; verify with `redbg info`.")
     else:
         print(f"read as {stats['format']}; outputs over 20000 chars are cut (sha256 kept).")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# demo / sessions
+# ---------------------------------------------------------------------------
+
+DEMO_FILES = ("sample-a.jsonl", "sample-b.jsonl")
+
+
+def cmd_demo(args) -> int:
+    """Write two small example traces so a pip user can try redbg in seconds."""
+    import importlib.resources as resources
+
+    dest = args.dir
+    try:
+        os.makedirs(dest, exist_ok=True)
+        existing = [n for n in DEMO_FILES if os.path.exists(os.path.join(dest, n))]
+        if existing and not args.force:
+            print(
+                f"redbg: {', '.join(existing)} already exist in {dest!r}; "
+                "use --force to overwrite or pick another folder",
+                file=sys.stderr,
+            )
+            return 2
+        for name in DEMO_FILES:
+            data = (resources.files("redbg") / "_samples" / name).read_bytes()
+            with open(os.path.join(dest, name), "wb") as out:
+                out.write(data)
+    except OSError as exc:
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
+        return 2
+    a = os.path.join(dest, DEMO_FILES[0])
+    b = os.path.join(dest, DEMO_FILES[1])
+
+    def q(x: str) -> str:
+        return f'"{x}"' if " " in x else x
+
+    print(f"wrote two example traces to {dest}")
+    print("try:")
+    print(f"  redbg diff {q(a)} {q(b)}")
+    print(f"  redbg check {q(b)} --baseline {q(a)}   (exits 1: the runs differ)")
+    print(f"  redbg audit {q(b)}")
+    print(f"  redbg replay {q(a)}")
+    return 0
+
+
+def _default_session_dirs() -> list[str]:
+    home = os.path.expanduser("~")
+    return [
+        os.path.join(home, ".claude", "projects"),
+        os.path.join(home, ".codex", "sessions"),
+    ]
+
+
+def _human_age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds // size}{unit} ago"
+    return f"{seconds}s ago"
+
+
+def cmd_sessions(args) -> int:
+    """List recent agent transcripts (newest first) so you can pass one to redbg."""
+    import time
+
+    dirs = args.dir or _default_session_dirs()
+    found: list[tuple[float, int, str]] = []
+    scanned = 0
+    for root in dirs:
+        for folder, _subdirs, files in os.walk(root):  # never follows symlinked dirs
+            for name in files:
+                if not (name.endswith(".jsonl") or name.endswith(".jsonl.gz")):
+                    continue
+                scanned += 1
+                if scanned > 50000:
+                    break
+                path = os.path.join(folder, name)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                found.append((st.st_mtime, st.st_size, path))
+    if not found:
+        shown = ", ".join(dirs)
+        print(
+            f"no transcripts found in: {shown}\n"
+            "pass --dir FOLDER to look somewhere else",
+            file=sys.stderr,
+        )
+        return 2
+    found.sort(reverse=True)
+    now = time.time()
+    limit = args.limit if args.limit > 0 else len(found)
+    if args.json:
+        rows = [
+            {"path": path, "bytes": size, "modified": mtime}
+            for mtime, size, path in found[:limit]
+        ]
+        print(json.dumps(rows, indent=2))
+        return 0
+    for mtime, size, path in found[:limit]:
+        print(f"{_human_age(now - mtime):>9}  {size / 1e6:8.2f} MB  {clean(path)}")
+    if len(found) > limit:
+        print(f"... {len(found) - limit} more (use --limit 0 for all)")
+    print("open one with: redbg audit PATH   or   redbg replay PATH")
     return 0
 
 
@@ -947,12 +1097,36 @@ _PII_HELP = "also treat e-mail addresses and Luhn-valid card numbers as sensitiv
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="redbg", description="gdb for agent sessions."
+        prog="redbg",
+        description="gdb for agent sessions.",
+        epilog=(
+            "new here? run `redbg demo` to get two example traces.\n"
+            "exit codes: 0 ok, 1 problems found (check/scan/audit --strict), "
+            "2 could not run (bad input, bad option, unwritable output), "
+            "141 output pipe closed, 130 interrupted"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("demo", help="write two example traces to try redbg on")
+    p.add_argument("dir", nargs="?", default="redbg-demo", help="folder (default: redbg-demo)")
+    p.add_argument("--force", action="store_true", help="overwrite existing example files")
+    p.set_defaults(func=cmd_demo)
+
+    p = sub.add_parser(
+        "sessions", help="list recent Claude Code / Codex transcripts on this machine"
+    )
+    p.add_argument(
+        "--dir", action="append", metavar="FOLDER",
+        help="folder to search (repeatable; default: ~/.claude/projects and ~/.codex/sessions)",
+    )
+    p.add_argument("--limit", type=int, default=15, help="rows to show (0 = all)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=cmd_sessions)
 
     p = sub.add_parser("replay", help="step through a session like a debugger")
     p.add_argument("trace")
@@ -1208,7 +1382,24 @@ def _materialize_stdin(args) -> None:
     setattr(args, names[0], path)
 
 
+def _safe_streams() -> None:
+    """Never crash because the console cannot show a character.
+
+    A Windows pipe/redirect is often cp1252 and a minimal Linux container is
+    often ASCII; the report symbols and any non-Latin trace text would raise
+    ``UnicodeEncodeError`` (a traceback and exit 1, which CI reads as "rule
+    violations"). Unencodable characters are printed as ``\\uXXXX`` instead.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if (stream.encoding or "").lower().replace("_", "-") not in ("utf-8", "utf8"):
+                stream.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _safe_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -1216,7 +1407,7 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except ValueError as exc:
         if "standard input" not in str(exc):
-            raise
+            return _internal_error(exc)
         print(f"redbg: {exc}", file=sys.stderr)
         return 2
     except BrokenPipeError:
@@ -1238,6 +1429,37 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+    except KeyboardInterrupt:
+        print("redbg: interrupted", file=sys.stderr)
+        return 130
+    except OSError as exc:
+        # Any file problem not handled closer to the command (unwritable
+        # output, folder given as a trace, disk full): say so plainly.
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
+        return 2
+    except MemoryError:
+        print("redbg: ran out of memory reading this input", file=sys.stderr)
+        return 2
+    except Exception as exc:  # noqa: BLE001 - last resort, see _internal_error
+        return _internal_error(exc)
+
+
+def _internal_error(exc: BaseException) -> int:
+    """Report a bug as a one-liner with exit 2, never a traceback with exit 1.
+
+    Exit 1 means "the check found problems"; a crash must not look like that.
+    ``REDBG_DEBUG=1`` restores the full traceback.
+    """
+    if os.environ.get("REDBG_DEBUG"):
+        raise exc
+    print(
+        f"redbg: unexpected {type(exc).__name__}: {exc}\n"
+        "  this is a bug in redbg or a trace it could not handle; set "
+        "REDBG_DEBUG=1 for the full traceback and please report it at "
+        "https://github.com/calasdan-sketch/redbg/issues",
+        file=sys.stderr,
+    )
+    return 2
 
 
 if __name__ == "__main__":

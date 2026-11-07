@@ -1,6 +1,53 @@
 # Changelog
 
-## 0.3.0 - unreleased (expert round 3)
+## 0.3.0 - unreleased
+
+**Round 4 (the stranger's first hour):**
+
+PyPI still serves 0.1.1; 0.2.0 was never published, so 0.3.0 is the first
+release containing everything below and the 0.2.0 / round 3 entries. Not a
+drop-in upgrade from 0.1.1 (see the "Behaviour change" notes). Details,
+scores and what could not be tested: `docs/ROUND4.md`.
+
+### Added
+- **`redbg demo [DIR]`**: writes two example traces, so `pip install redbg`
+  users can try `diff` / `check` without cloning the repo.
+- **`redbg sessions`**: lists recent Claude Code / Codex transcripts on this
+  machine (newest first, `--dir`, `--limit`, `--json`).
+- `python -m redbg` (same as the command); `py.typed` (the package is typed
+  and `mypy src` is clean); `LICENSE` file shipped in the wheel and sdist;
+  `--help` documents the exit codes.
+- Project URLs (repository, issues, changelog), Python 3.9-3.13 and
+  "Typing :: Typed" classifiers, SPDX license expression; `MANIFEST.in`
+  (sdist carries tests, examples, bench and CHANGELOG).
+- `.github/workflows/ci.yml`: tests on Linux/Windows/macOS x Python
+  3.9/3.11/3.13, lint, type check, build + `twine check` + clean-wheel quick
+  start (written, not yet run on GitHub).
+
+### Fixed
+- A console that cannot show a character (cp1252 redirect on Windows, ASCII
+  container) crashed with a traceback and exit 1 - which CI reads as "rule
+  violations". Such characters now print as `\uXXXX`.
+- An unwritable output (`--export-md`, `--export-html`, `fork --save`, a
+  folder given as a trace...) gave a traceback and exit 1; now one plain line
+  and exit 2. File errors read "cannot open 'x': no such file or folder"
+  instead of `[Errno 2] ...`. **Behaviour change**: any unexpected crash is
+  now exit 2 with a one-line message (`REDBG_DEBUG=1` for the traceback)
+  instead of a traceback with exit 1; Ctrl-C exits 130.
+- `fork --tools FILE` whose code raises or calls `sys.exit()` now exits 2 with
+  the error, instead of a traceback (or a silent exit 0 for `sys.exit(0)`).
+- `redact -o` wrote straight into the destination: a bad line half-way left
+  a truncated trace there. It now writes beside it and moves it into place
+  when complete (as `import` already did); symlinked outputs and devices such
+  as `/dev/null` still work.
+- Written traces, reports and JUnit files always use `\n` line endings
+  (Windows text mode wrote `\r\n`).
+- Windows: replacing a file another program has open is retried briefly;
+  ANSI colors are only used when the console accepts them.
+- `bench/bench.py` no longer builds a shell command from the checkout path.
+- 15 `mypy` errors (none changed behaviour).
+
+**Round 3 (earlier, same unreleased version):**
 
 Round 3 panel: incident responder, red-team attacker, privacy/compliance
 auditor, Windows/cross-platform engineer, CI/DevOps engineer, performance
@@ -54,7 +101,7 @@ re-review of the new code).
 - README quick-start output listed `rules: complete, baseline`; the real
   output includes `non_empty`.
 
-## 0.3.0 — unreleased
+**Round 2 (earlier, same unreleased version):**
 
 Expert round 2 (agent-observability, transcript-format, security/privacy,
 incident-response and TUI/DX reviews; skeptical-user pass).

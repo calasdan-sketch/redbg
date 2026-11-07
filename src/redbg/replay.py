@@ -11,6 +11,7 @@ import gzip
 import json
 import os
 from dataclasses import dataclass, field
+from typing import Any
 
 from .schema import (
     NOTE,
@@ -303,8 +304,8 @@ class Session:
     def _index(self) -> None:
         self.usage = {}
         steps: list[Step] = []
-        by_call_id: dict[str, Step] = {}
-        pending_results: dict[str, dict] = {}
+        by_call_id: dict[Any, Step] = {}
+        pending_results: dict[Any, dict] = {}
         last_prompt: dict | None = None
         last_response: dict | None = None
 
@@ -338,9 +339,9 @@ class Session:
                 steps.append(step)
             elif etype == TOOL_RESULT:
                 call_id = event.get("call_id")
-                step = by_call_id.get(call_id)
-                if step is not None:
-                    step.result = event
+                found = by_call_id.get(call_id)
+                if found is not None:
+                    found.result = event
                 else:
                     pending_results[call_id] = event
         # Orphan results (no matching call): surface them as steps with no
