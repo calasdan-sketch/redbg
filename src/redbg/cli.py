@@ -8,7 +8,13 @@ Subcommands:
   redact SRC -o DST   strip secrets from a trace
   scan TRACE          audit a trace for likely secrets (exit 1 if found)
   info TRACE          session summary
-  import SRC -o DST   convert OTel/Langfuse-shaped traces to redbg format
+  import SRC -o DST   convert Claude Code / Codex / chat-message / OTel logs
+  why TRACE N         why did the agent make call N? (causal chain)
+  files TRACE         which files each step read / wrote / deleted
+  blame TRACE PATH    which steps touched PATH
+
+Every command opens redbg traces, Claude Code transcripts, Codex rollouts and
+OpenAI/Anthropic message logs directly (format auto-detected).
 """
 
 from __future__ import annotations
@@ -22,9 +28,11 @@ import sys
 
 from . import __version__
 from ._text import clean, md_fence
+from .analysis import Breakpoint, blame, explain, file_ledger, run_to_breakpoint
 from .check import FAIL_ON_CHOICES, CheckRules, run_check
 from .diff import diff_to_dict, find_repeats, render_diff
 from .fork import ForkSpec, fork_session
+from .htmlexport import render_html
 from .importer import import_file
 from .redact import redact_file, scan_file
 from .replay import Navigator, Session, ensure_distinct
@@ -199,6 +207,81 @@ def export_markdown(session: Session) -> str:
     return "\n".join(lines)
 
 
+def render_explanation(exp, color: bool) -> str:
+    def brief(rows):
+        return ", ".join(
+            f"{n}:{clean(tool)}{'' if ok else ' (FAIL)' if ok is False else ' (?)'}"
+            for n, tool, ok in rows
+        )
+
+    lines = [_c(f"── why step {exp.step}: {clean(exp.tool)} ──", BOLD, color)]
+    lines.append(_c("user asked:", CYAN, color))
+    lines.append(_truncate(exp.prompt or "(no prompt recorded before this call)", 500))
+    if exp.model_text:
+        lines.append(_c("model said just before:", CYAN, color))
+        lines.append(_truncate(exp.model_text, 500))
+    if exp.turn_steps:
+        lines.append(_c("earlier steps in this turn:", CYAN, color))
+        lines.append("  " + brief(exp.turn_steps[-12:]))
+    lines.append(_c("where the values in this call came from:", CYAN, color))
+    if not exp.provenance:
+        lines.append("  (no concrete values in the arguments)")
+    for prov in exp.provenance:
+        mark = _c("??", RED, color) if prov.origin == "nowhere" else "<-"
+        origin = (
+            "not found in anything the agent had seen (invented, or hidden by "
+            "output truncation)"
+            if prov.origin == "nowhere"
+            else prov.origin
+        )
+        lines.append(f"  {mark} {_truncate(prov.value, 80)}  {origin}")
+    if exp.effects:
+        lines.append(_c("effects:", CYAN, color))
+        for eff in exp.effects:
+            lines.append(f"  {eff.kind} {clean(eff.path)} ({eff.how})")
+    if exp.next_steps:
+        lines.append(_c("what happened next:", CYAN, color))
+        lines.append("  " + brief(exp.next_steps))
+    return "\n".join(lines)
+
+
+def render_ledger(session: Session, color: bool) -> str:
+    ledger = file_ledger(session)
+    if not ledger:
+        return "no file effects found (shell scripts that write files internally are invisible)."
+    lines = []
+    for path, effs in sorted(ledger.items()):
+        hist = " ".join(
+            f"{e.kind[0]}{e.step}{'*' if e.how == 'inferred' else ''}"
+            + ("!" if e.ok is False else "")
+            for e in effs
+        )
+        lines.append(f"{clean(path)}  {hist}")
+    lines.append(
+        "legend: r=read w=write d=delete, number=step, *=inferred from a shell "
+        "command, !=step failed"
+    )
+    return "\n".join(lines)
+
+
+def render_blame(session: Session, path: str, color: bool) -> str:
+    if not path:
+        return "usage: blame PATH"
+    hits = blame(session, path)
+    if not hits:
+        return f"no step touched {clean(path)}."
+    lines = []
+    for e in hits:
+        by = session.get_step(e.step)
+        why = (by.response_ctx or {}).get("text") or ""
+        lines.append(
+            f"step {e.step:>4}  {e.kind:<6} {clean(e.path)}  [{clean(e.tool)}, {e.how}"
+            f"{', FAILED' if e.ok is False else ''}]  "
+            + clean(why.strip().replace("\n", " ")[:80])
+        )
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # The replay REPL
 # ---------------------------------------------------------------------------
@@ -211,6 +294,13 @@ commands:
   l, list        list all steps
   s, show [N]    show step details (default: current step)
   /pattern       search tool/args/output for pattern
+  b, break SPEC  stop on: a tool glob (Bash, mcp__*), fail, slow:MS,
+                 file:PATH, or ~REGEX      (tb SPEC = one-shot)
+  info break     list breakpoints;  delete N  remove breakpoint N
+  c, continue    run forward to the next breakpoint
+  rc             run backward to the previous breakpoint
+  why [N]        why was call N made? prompt, earlier steps, value origins
+  files          files touched by each step;  blame PATH = who touched PATH
   t, time        timing table for all steps
   i, info        session summary
   q, quit        quit
@@ -223,6 +313,8 @@ class Repl:
         self.nav = Navigator(session)
         self.session = session
         self.color = color
+        self.breakpoints: list[Breakpoint] = []
+        self._bp_seq = 0
 
     def _prompt(self) -> str:
         at = self.nav.cursor
@@ -241,6 +333,57 @@ class Repl:
                 )
             )
             return
+        print(render_step(step, self.nav.count, self.color))
+
+    def _add_break(self, spec: str, temporary: bool) -> None:
+        try:
+            bp = Breakpoint.parse(spec, temporary=temporary)
+        except ValueError as exc:
+            print(_c(f"break: {exc}", RED, self.color))
+            return
+        self._bp_seq += 1
+        bp.number = self._bp_seq
+        self.breakpoints.append(bp)
+        print(f"breakpoint {bp.number}: {clean(bp.spec)}")
+
+    def _list_breaks(self) -> None:
+        if not self.breakpoints:
+            print(_c("no breakpoints.", DIM, self.color))
+        for bp in self.breakpoints:
+            tmp = " (temporary)" if bp.temporary else ""
+            print(f"  {bp.number}: {clean(bp.spec)}{tmp}  hits={bp.hits}")
+
+    def _delete_break(self, arg: str) -> None:
+        if not arg.strip():
+            self.breakpoints.clear()
+            print("all breakpoints deleted.")
+            return
+        try:
+            num = int(arg)
+        except ValueError:
+            print(_c("usage: delete [N]", RED, self.color))
+            return
+        before = len(self.breakpoints)
+        self.breakpoints = [b for b in self.breakpoints if b.number != num]
+        print("deleted." if len(self.breakpoints) < before else "no such breakpoint.")
+
+    def _continue(self, reverse: bool) -> None:
+        if not self.breakpoints:
+            print(_c("no breakpoints set — use `break SPEC` first.", YELLOW, self.color))
+            return
+        n, bp = run_to_breakpoint(
+            self.session, self.nav.cursor, self.breakpoints, reverse=reverse
+        )
+        if n is None:
+            end = "start" if reverse else "end"
+            self.nav.cursor = 0 if reverse else self.nav.count
+            print(_c(f"no more breakpoint hits before the {end}.", DIM, self.color))
+            return
+        bp.hits += 1
+        if bp.temporary:
+            self.breakpoints = [b for b in self.breakpoints if b is not bp]
+        step = self.nav.goto(n)
+        print(_c(f"hit breakpoint {bp.number} ({clean(bp.spec)})", YELLOW, self.color))
         print(render_step(step, self.nav.count, self.color))
 
     def run_command(self, raw: str) -> bool:
@@ -306,7 +449,26 @@ class Repl:
         elif cmd in ("t", "time"):
             print(render_list(self.session, self.color))
         elif cmd in ("i", "info"):
-            print(render_info(self.session, self.color))
+            if arg.strip().lower() in ("break", "breaks", "breakpoints"):
+                self._list_breaks()
+            else:
+                print(render_info(self.session, self.color))
+        elif cmd in ("b", "break", "tb", "tbreak"):
+            self._add_break(arg, temporary=cmd in ("tb", "tbreak"))
+        elif cmd in ("delete", "del", "d"):
+            self._delete_break(arg)
+        elif cmd in ("c", "continue", "rc", "reverse-continue"):
+            self._continue(reverse=cmd in ("rc", "reverse-continue"))
+        elif cmd == "why":
+            try:
+                n = int(arg) if arg.strip() else self.nav.cursor
+                print(render_explanation(explain(self.session, n), self.color))
+            except (ValueError, IndexError) as exc:
+                print(_c(f"why: {exc}", RED, self.color))
+        elif cmd == "files":
+            print(render_ledger(self.session, self.color))
+        elif cmd == "blame":
+            print(render_blame(self.session, arg.strip(), self.color))
         else:
             print(_c(f"unknown command {cmd!r} — `h` for help.", YELLOW, self.color))
         return True
@@ -340,9 +502,36 @@ class Repl:
 # ---------------------------------------------------------------------------
 
 
+LAZY_BYTES = 4 * 1024 * 1024
+
+
+def _lazy_limit(args):
+    """Stop after step N for ``--show N`` on big plain files only.
+
+    Small files load fully so the ``N/total`` counter stays exact; above
+    ``LAZY_BYTES`` the total is shown as ``?`` and the first view appears
+    in milliseconds instead of after a full parse.
+    """
+    if not args.show or args.list or args.export_md or args.export_html:
+        return None
+    try:
+        if args.trace.endswith(".gz") or os.path.getsize(args.trace) < LAZY_BYTES:
+            return None
+    except OSError:
+        return None
+    return args.show
+
+
 def cmd_replay(args) -> int:
     try:
-        session = Session.load(args.trace, skip_bad=args.skip_bad)
+        session = Session.load(
+            args.trace,
+            skip_bad=args.skip_bad,
+            redact=args.redact,
+            # --show N needs only the first N steps: time-to-first-view
+            # stays flat however large the file is.
+            max_steps=_lazy_limit(args),
+        )
     except (ValueError, OSError) as exc:
         print(f"redbg: {exc}", file=sys.stderr)
         return 2
@@ -351,6 +540,14 @@ def cmd_replay(args) -> int:
         with open(args.export_md, "w", encoding="utf-8") as handle:
             handle.write(export_markdown(session))
         print(f"wrote {args.export_md}")
+        return 0
+    if args.export_html:
+        if not args.redact and not args.no_redact_html:
+            session = Session.load(args.trace, skip_bad=args.skip_bad, redact=True)
+        with open(args.export_html, "w", encoding="utf-8") as handle:
+            handle.write(render_html(session))
+        note = "" if (args.redact or not args.no_redact_html) else " (NOT redacted)"
+        print(f"wrote {args.export_html}{note}")
         return 0
     if args.list:
         print(render_list(session, color))
@@ -361,9 +558,70 @@ def cmd_replay(args) -> int:
         except IndexError as exc:
             print(f"redbg: {exc}", file=sys.stderr)
             return 2
-        print(render_step(step, len(session.steps), color))
+        print(render_step(step, "?" if session.partial else len(session.steps), color))
         return 0
     Repl(session, color).run(script=args.cmd)
+    return 0
+
+
+def _load_or_fail(args, **kw):
+    try:
+        return Session.load(args.trace, skip_bad=args.skip_bad, **kw)
+    except (ValueError, OSError) as exc:
+        print(f"redbg: {exc}", file=sys.stderr)
+        return None
+
+
+def cmd_why(args) -> int:
+    session = _load_or_fail(args, redact=args.redact)
+    if session is None:
+        return 2
+    try:
+        exp = explain(session, args.step)
+    except IndexError as exc:
+        print(f"redbg: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "step": exp.step,
+                    "tool": exp.tool,
+                    "ok": exp.ok,
+                    "prompt": exp.prompt,
+                    "model_text": exp.model_text,
+                    "turn_steps": exp.turn_steps,
+                    "next_steps": exp.next_steps,
+                    "provenance": [vars(p) for p in exp.provenance],
+                    "effects": [vars(e) for e in exp.effects],
+                },
+                indent=2,
+                default=str,
+            )
+        )
+        return 0
+    print(render_explanation(exp, _color_enabled() and not args.no_color))
+    return 0
+
+
+def cmd_files(args) -> int:
+    session = _load_or_fail(args, redact=args.redact)
+    if session is None:
+        return 2
+    color = _color_enabled() and not args.no_color
+    if args.json:
+        ledger = file_ledger(session)
+        print(json.dumps({p: [vars(e) for e in effs] for p, effs in ledger.items()}, indent=2))
+        return 0
+    print(render_ledger(session, color))
+    return 0
+
+
+def cmd_blame(args) -> int:
+    session = _load_or_fail(args, redact=args.redact)
+    if session is None:
+        return 2
+    print(render_blame(session, args.path, _color_enabled() and not args.no_color))
     return 0
 
 
@@ -546,7 +804,7 @@ def cmd_info(args) -> int:
 
 def cmd_import(args) -> int:
     try:
-        stats = import_file(args.src, args.dst)
+        stats = import_file(args.src, args.dst, redact=args.redact)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"redbg: {exc}", file=sys.stderr)
         return 2
@@ -554,7 +812,10 @@ def cmd_import(args) -> int:
         f"imported {stats['steps']} tool steps "
         f"({stats['events']} events) -> {stats['dst']}"
     )
-    print("note: import is heuristic and lossy; verify the result with `redbg info`.")
+    if stats.get("format") in (None, "otel"):
+        print("note: OTel import is heuristic and lossy; verify with `redbg info`.")
+    else:
+        print(f"read as {stats['format']}; outputs over 20000 chars are cut (sha256 kept).")
     return 0
 
 
@@ -570,6 +831,11 @@ def _add_common(parser) -> None:
         help="skip malformed lines instead of failing",
     )
     parser.add_argument("--no-color", action="store_true", help="disable ANSI colors")
+    parser.add_argument(
+        "--redact",
+        action="store_true",
+        help="redact secrets from everything shown (nothing is written)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -590,6 +856,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--export-md", metavar="FILE", help="write a Markdown report and exit"
+    )
+    p.add_argument(
+        "--export-html",
+        metavar="FILE",
+        help="write a self-contained, script-free HTML report (redacted by default)",
+    )
+    p.add_argument(
+        "--no-redact-html",
+        action="store_true",
+        help="do not redact the HTML report (not safe to share)",
     )
     _add_common(p)
     p.set_defaults(func=cmd_replay)
@@ -710,11 +986,33 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p)
     p.set_defaults(func=cmd_info)
 
-    p = sub.add_parser("import", help="convert OTel/Langfuse traces to redbg")
+    p = sub.add_parser(
+        "import",
+        help="convert Claude Code / Codex / message-array / OTel logs to redbg",
+    )
     p.add_argument("src")
     p.add_argument("-o", "--dst", required=True)
     _add_common(p)
     p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("why", help="why did the agent make call N?")
+    p.add_argument("trace")
+    p.add_argument("step", type=int)
+    p.add_argument("--json", action="store_true")
+    _add_common(p)
+    p.set_defaults(func=cmd_why)
+
+    p = sub.add_parser("files", help="files each step read / wrote / deleted")
+    p.add_argument("trace")
+    p.add_argument("--json", action="store_true")
+    _add_common(p)
+    p.set_defaults(func=cmd_files)
+
+    p = sub.add_parser("blame", help="which steps touched PATH")
+    p.add_argument("trace")
+    p.add_argument("path")
+    _add_common(p)
+    p.set_defaults(func=cmd_blame)
 
     return parser
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "redbg"
-version = "0.2.0"
+version = "0.3.0"
 description = "gdb for agent sessions: record, replay, diff, and fork tool-calling runs"
 readme = "README.md"
 requires-python = ">=3.9"

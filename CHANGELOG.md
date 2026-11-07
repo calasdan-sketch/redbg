@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.0 — unreleased
+
+Expert round 2 (agent-observability, transcript-format, security/privacy,
+incident-response and TUI/DX reviews; skeptical-user pass).
+
+### Added
+- **Reads real transcripts directly**: Claude Code JSONL, Codex rollouts,
+  OpenAI/Anthropic message arrays/JSONL (and `.gz`), auto-detected by
+  every command (`replay`, `diff`, `check`, `fork`, `info`, `scan`...).
+  Streaming, schema-drift tolerant, crash tolerant (cut-off last line ->
+  status `truncated`, so `check` fails closed). `redbg import` now converts
+  these too (`--redact`, atomic write).
+- **`redbg why TRACE N`** (and `why` in the REPL): the prompt and model text
+  behind a call, earlier steps in the turn, and where each concrete value in
+  its arguments first appeared - or that it appeared nowhere. `--json`.
+- **`redbg files` / `redbg blame TRACE PATH`**: file read/write/delete ledger
+  per step (declared for edit tools and apply_patch, inferred for shell).
+- **Breakpoints** in the REPL: `break` (tool glob, `fail`, `slow:MS`,
+  `file:PATH`, `~REGEX`), `tb`, `c`, `rc`, `info break`, `delete`.
+- **`replay --export-html`**: script-free, CSP-locked, escaped, redacted by
+  default (`--no-redact-html` to opt out). `--redact` on every viewing
+  command.
+- **Time-to-first-view**: `replay --show N` on files over 4 MB stops reading
+  after step N (counter shows `N/?`).
+- `bench/`: deterministic generators + `bench/bench.py` (load time, peak
+  memory, time-to-first-view, optional older git ref) and `RESULTS.md`.
+- 47 new tests, including a mutation fuzz of hostile Claude Code / Codex
+  logs.
+
+### Changed
+- Trace files are read with `errors="replace"`: a log cut mid-character now
+  opens instead of failing with a decode error.
+- `Session.load` accepts `max_steps`, `max_output_chars`, `redact`;
+  `Session` gains `partial` and `format`. `load_events` is unchanged
+  (native only); `iter_native` / `iter_any` stream.
+- Version 0.3.0.
+
 ## 0.2.0 — unreleased
 
 ### Panel-review fixes (second pass)

@@ -1,7 +1,9 @@
 # redbg — gdb for agent sessions
 
-**Find the exact step where your agent went wrong — and fail CI when it
-happens again.** Local files, no account, no server, zero dependencies.
+**Open any agent transcript — Claude Code, Codex, OpenAI/Anthropic message
+logs, or your own — find the exact step where it went wrong, ask *why* it did
+that, and fail CI when it happens again.** Local files, no account, no server,
+zero dependencies. A 100 MB transcript shows its first step in about 0.1 s.
 
 Record tool-calling agent sessions, then debug them like a program:
 **step** forward/back through tool calls, **inspect** the exact
@@ -25,6 +27,53 @@ $ redbg diff monday.jsonl tuesday.jsonl
 ── args diff at divergence ──
 ...
 ```
+
+## Debug a real session (Claude Code, Codex, message logs)
+
+No conversion step: every command reads these formats directly (auto-detected,
+`.gz` too).
+
+```bash
+redbg replay ~/.claude/projects/<project>/<session>.jsonl   # step through it
+redbg why   session.jsonl 42      # why was call 42 made?
+redbg blame session.jsonl src/app.py   # which steps touched this file?
+redbg files session.jsonl         # every file read / written / deleted
+redbg replay session.jsonl --export-html report.html   # share-safe page
+```
+
+```
+$ redbg why session.jsonl 42      # illustrative output
+── why step 42: Read ──
+user asked:
+Fix the bug in main.py
+model said just before:
+Let me check the config.
+earlier steps in this turn:
+  38:Bash, 39:Grep, 40:Read, 41:Bash (FAIL)
+where the values in this call came from:
+  <- main.py                  prompt
+  <- config/app.yaml          step 39 output
+  ?? /etc/invented/path.cfg   not found in anything the agent had seen (invented, or hidden by output truncation)
+effects:
+  read /etc/invented/path.cfg (declared)
+```
+
+`why` answers the incident question — *where did the agent get this value?* —
+by searching what it had seen before the call (prompts, its own text, earlier
+arguments and outputs). A value found nowhere is the classic invented path,
+URL or ID. It is substring matching, not mind reading: see Limitations.
+
+**Breakpoints** in the replay REPL, like gdb: `break Bash`, `break fail`,
+`break file:src/app.py` (steps that touch that file), `break slow:5000`,
+`break ~regex`, then `c` (continue) or `rc` (reverse-continue); `tb` sets a
+one-shot breakpoint; `why`, `files` and `blame PATH` work at the prompt.
+
+**Safe to share.** `--export-html` writes one self-contained page with no
+scripts, no external resources and a strict Content-Security-Policy; all
+trace text is escaped and secrets are redacted unless you pass
+`--no-redact-html`. `--redact` on any command scrubs what is displayed.
+Redaction runs on the full text *before* long outputs are cut, so a cut can
+never leave half a private key behind.
 
 ## Install
 
@@ -205,7 +254,26 @@ A *step* is one `tool_call`/`tool_result` pair. Unknown event types are
 preserved on load (a newer recorder's trace still opens) but ignored by the
 step engine. See `examples/sample-a.jsonl`.
 
-## Importing existing traces
+## Reading other tools' logs
+
+| format | detected by | notes |
+|---|---|---|
+| Claude Code transcripts | `sessionId` / `uuid` lines | tool_use/tool_result paired by id; real timestamps give real durations; subagent (sidechain) steps are flagged; thinking blocks, attachments and queue lines are skipped and counted |
+| Codex CLI rollouts | `response_item` + `payload` | `function_call`, `local_shell_call`, `apply_patch` and their outputs; the exit code inside the output envelope sets ok/failed |
+| OpenAI / Anthropic message logs | `role` + `tool_calls` / content blocks | JSON array, `{"messages": [...]}`, or JSONL |
+| OTel / Langfuse exports | `spans` / `observations` | heuristic and lossy (below) |
+
+The field mappings come from the logs as we have seen them and vendors change
+them without notice: unknown line or block types are counted in a note
+(`redbg info` shows it), never fatal. A cut-off final line (writer killed
+mid-write) is reported and the session ends with status `truncated`, so
+`redbg check` fails closed on it. Tool outputs over 20,000 characters are
+cut with their SHA-256 kept (diffs still see changes). Formats were verified
+against real Claude Code transcripts; the Codex and message-array mappings
+follow the documented shapes and are covered by synthetic fixtures only.
+`redbg import SRC -o OUT.jsonl [--redact]` writes the converted native trace.
+
+## Importing OTel traces
 
 `redbg import` converts OTel-shaped spans and Langfuse-shaped observations
 (`{"observations": [...]}` / `{"spans": [...]}` / `{"traces": [...]}`) into
@@ -287,7 +355,19 @@ before sharing any trace, and `redbg redact` to clean one.
   cycles (`a, b, a, b, …`) aren't flagged by `--max-repeats`; use
   `--max-steps` as a backstop.
 - **Single-agent sessions.** Multi-agent / swarm traces (parallel tool calls
-  across agents) load, but the step engine treats them as one flat sequence.
+  across agents) load, but the step engine treats them as one flat sequence
+  (Claude Code subagent steps are flagged `sidechain` but still interleaved).
+- **`why` is evidence, not proof.** It cannot see the model's reasoning
+  (thinking blocks are not read), outputs cut at 20,000 characters can hide
+  an origin, and a value that only *resembles* an earlier one is not linked.
+  "Not found" means "not found in the stored text".
+- **File effects are partial for shell.** Edit/Write/apply_patch name their
+  files (declared). For Bash/shell, redbg parses redirects, `tee`, `sed -i`,
+  `rm`, `mv`, `cp`, `touch` (inferred, marked `*`); anything a script writes
+  internally is invisible. `files`/`blame` show what is *known*, not a
+  complete audit.
+- **Breakpoint regexes are yours.** `break ~REGEX` runs your pattern over
+  every step; a pathological pattern is slow.
 - **Timestamps are wall-clock.** Cross-machine comparison of durations is
   approximate; `mono` deltas are only meaningful within one recording host.
 - **Import is lossy.** Anything the heuristics don't recognize becomes a
@@ -314,6 +394,27 @@ Where redbg is weaker: no auto-instrumentation, no web UI, no LLM-judge
 scoring (rewind has these). Where it aims to be stronger: nothing to run
 or sign up for, a plain JSONL format you can grep, and a diff that tells
 you the *first* step that diverged.
+
+### Opening big Claude Code transcripts (measured)
+
+Same machine, run by us; re-run redbg's side with `python bench/bench.py`
+(inputs are generated, no real data; numbers vary run to run, 2x on a busy
+host). Peak memory is the process's maximum resident size.
+
+| | what it does | 100 MB synthetic transcript | 7 MB real transcript |
+|---|---|---|---|
+| **redbg 0.3** | interactive debugger | first step on screen in **0.07-0.10 s**; full load 1.4 s, 107 MB | first step 0.07 s, 19 MB |
+| redbg 0.2 (before) | interactive debugger | cannot open (rejects the format) | cannot open |
+| [claude-code-transcripts](https://pypi.org/project/claude-code-transcripts/) 0.6 (`json`) | static HTML pages | 6.2 s, 267 MB, writes 88 MB of HTML | 0.4 s, 49 MB |
+| [claude-code-log](https://pypi.org/project/claude-code-log/) 1.7.0 | static HTML/Markdown | not run: its strict validation rejected our synthetic attachment lines | 1.7 s, 94 MB |
+
+The two viewers are converters (read the result in a browser); neither
+steps, diffs, breaks, explains or gates CI, so the table compares only
+"time until you can see something". Commercial trace UIs
+([Langfuse](https://langfuse.com), [LangSmith](https://docs.smith.langchain.com),
+[Arize Phoenix](https://github.com/Arize-ai/phoenix),
+[AgentOps](https://www.agentops.ai)) need SDK instrumentation and a
+server or account; we did not benchmark them and make no speed claim.
 
 ## Roadmap (v2, not promised)
 

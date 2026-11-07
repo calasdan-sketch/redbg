@@ -14,7 +14,9 @@ Accepted shapes:
 
 from __future__ import annotations
 
+import gzip
 import json
+import os
 
 from .replay import ensure_distinct
 from .schema import (
@@ -181,14 +183,31 @@ def import_events(obj) -> list[dict]:
     return events
 
 
-def import_file(src: str, dst: str) -> dict:
-    """Read an external trace file, write redbg JSONL. Returns stats."""
+def import_file(src: str, dst: str, redact: bool = False) -> dict:
+    """Convert any supported log to a redbg trace. Returns stats.
+
+    Claude Code / Codex / message-array logs are streamed (constant
+    memory); OTel/Langfuse exports are heuristic and lossy.
+    """
+    from . import formats
+    from .replay import iter_any
+
     ensure_distinct(src, dst)
-    with open(src, encoding="utf-8") as handle:
-        obj = json.load(handle)
-    events = import_events(obj)
-    with open(dst, "w", encoding="utf-8") as handle:
-        for event in events:
-            handle.write(json.dumps(event, default=str) + "\n")
-    steps = sum(1 for e in events if e.get("type") == TOOL_CALL)
-    return {"events": len(events), "steps": steps, "dst": dst}
+    fmt = formats.sniff(src)
+    if fmt == formats.NATIVE:
+        raise ValueError(f"{src!r} is already a redbg trace (nothing to import)")
+    events = 0
+    steps = 0
+    tmp = dst + ".part"
+    opener = gzip.open if dst.endswith(".gz") else open
+    try:
+        with opener(tmp, "wt", encoding="utf-8") as handle:
+            for event in iter_any(src, fmt=fmt, redact=redact):
+                handle.write(json.dumps(event, default=str, ensure_ascii=False) + "\n")
+                events += 1
+                steps += event.get("type") == TOOL_CALL
+        os.replace(tmp, dst)  # never leave a half-written trace at dst
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return {"events": events, "steps": steps, "dst": dst, "format": fmt}

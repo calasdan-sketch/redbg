@@ -28,8 +28,9 @@ from .schema import (
 def open_trace(path: str):
     """Open a trace file for reading (transparent ``.gz`` support)."""
     if path.endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8")
-    return open(path, encoding="utf-8")
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    # errors="replace": a log whose writer died mid-character must still open.
+    return open(path, encoding="utf-8", errors="replace")
 
 
 def ensure_distinct(src: str, dst: str) -> None:
@@ -53,14 +54,13 @@ def ensure_distinct(src: str, dst: str) -> None:
         )
 
 
-def load_events(path: str, skip_bad: bool = False) -> list[dict]:
-    """Read every event from a JSONL trace.
+def iter_native(path: str, skip_bad: bool = False):
+    """Stream validated events from a native redbg JSONL trace.
 
     Raises ``ValueError`` naming the offending line on malformed JSON or
     invalid events, unless ``skip_bad`` is set (bad lines are then
-    counted and ignored — use for salvaging crashed recordings).
+    counted, ignored, and reported in a trailing note).
     """
-    events: list[dict] = []
     skipped = 0
     with open_trace(path) as handle:
         for line_no, line in enumerate(handle, start=1):
@@ -89,15 +89,47 @@ def load_events(path: str, skip_bad: bool = False) -> list[dict]:
                     )
                 skipped += 1
                 continue
-            events.append(event)
+            yield event
     if skipped:
-        events.append(
-            new_event(
-                NOTE,
-                text=f"[redbg] skipped {skipped} malformed line(s) while loading",
-            )
+        yield new_event(
+            NOTE,
+            text=f"[redbg] skipped {skipped} malformed line(s) while loading",
         )
-    return events
+
+
+def iter_any(
+    path: str,
+    skip_bad: bool = False,
+    max_output_chars: int | None = None,
+    redact: bool = False,
+    fmt: str | None = None,
+):
+    """Stream events from any supported log (native or foreign), auto-detected."""
+    from . import formats
+
+    fmt = fmt or formats.sniff(path)
+    if fmt == formats.NATIVE:
+        if redact:
+            from .redact import redact_event
+
+            for event in iter_native(path, skip_bad):
+                yield redact_event(event)[0]
+        else:
+            yield from iter_native(path, skip_bad)
+        return
+    yield from formats.iter_events(
+        path,
+        fmt,
+        max_output_chars=(
+            formats.DEFAULT_MAX_OUTPUT_CHARS if max_output_chars is None else max_output_chars
+        ),
+        redact=redact,
+    )
+
+
+def load_events(path: str, skip_bad: bool = False) -> list[dict]:
+    """Read every event from a native JSONL trace (strict; see ``iter_native``)."""
+    return list(iter_native(path, skip_bad))
 
 
 @dataclass
@@ -168,11 +200,52 @@ class Session:
     session_id: str | None = None
     meta: dict = field(default_factory=dict)
     status: str | None = None
+    partial: bool = False
+    format: str = ""
 
     @classmethod
-    def load(cls, path: str, skip_bad: bool = False) -> Session:
-        events = load_events(path, skip_bad=skip_bad)
+    def load(
+        cls,
+        path: str,
+        skip_bad: bool = False,
+        *,
+        max_steps: int | None = None,
+        max_output_chars: int | None = None,
+        redact: bool = False,
+    ) -> Session:
+        """Load a trace in any supported format (auto-detected).
+
+        ``max_steps`` stops reading once that many tool results have been
+        seen (``session.partial`` is then True): time-to-first-view stays
+        flat no matter how big the file is. ``redact`` scrubs secrets
+        from every event before it is indexed.
+        """
+        from . import formats
+
+        fmt = formats.sniff(path)
+        if fmt == formats.NATIVE and max_steps is None and not redact:
+            # The common strict path keeps its exact historical behaviour.
+            session = cls(path=path, events=load_events(path, skip_bad=skip_bad))
+            session.format = fmt
+            session._index()
+            return session
+        events: list[dict] = []
+        results = 0
+        partial = False
+        stream = iter_any(
+            path, skip_bad, max_output_chars=max_output_chars, redact=redact, fmt=fmt
+        )
+        for event in stream:
+            events.append(event)
+            if max_steps is not None and event.get("type") == TOOL_RESULT:
+                results += 1
+                if results >= max_steps:
+                    partial = True
+                    stream.close()
+                    break
         session = cls(path=path, events=events)
+        session.partial = partial
+        session.format = fmt
         session._index()
         return session
 
