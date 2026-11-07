@@ -20,17 +20,44 @@ from .schema import (
     SESSION_START,
     TOOL_CALL,
     TOOL_RESULT,
+    USAGE,
     new_event,
     validate_event,
 )
 
 
+def _sniff_encoding(path: str) -> tuple[bool, str]:
+    """Return (is_gzip, text encoding) from the first bytes of ``path``.
+
+    Windows PowerShell 5 writes ``> trace.jsonl`` as UTF-16 LE with a BOM
+    and many Windows editors add a UTF-8 BOM; both must open. gzip is
+    recognised by its magic number, so a misnamed or piped ``.gz`` works.
+    """
+    try:
+        if not os.path.isfile(path):  # a pipe/FIFO: reading would consume bytes
+            return path.endswith(".gz"), "utf-8"
+        with open(path, "rb") as raw:
+            head = raw.read(4)
+    except OSError:
+        return path.endswith(".gz"), "utf-8"
+    if head[:2] == b"\x1f\x8b":
+        return True, "utf-8"
+    if head[:3] == b"\xef\xbb\xbf":
+        return False, "utf-8-sig"
+    if head[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):
+        return False, "utf-32"
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return False, "utf-16"
+    return False, "utf-8"
+
+
 def open_trace(path: str):
-    """Open a trace file for reading (transparent ``.gz`` support)."""
-    if path.endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
-    # errors="replace": a log whose writer died mid-character must still open.
-    return open(path, encoding="utf-8", errors="replace")
+    """Open a trace file for reading (transparent gzip, UTF-8/16/32 BOMs)."""
+    is_gz, encoding = _sniff_encoding(path)
+    if is_gz or path.endswith(".gz"):
+        # errors="replace": a log whose writer died mid-character must open.
+        return gzip.open(path, "rt", encoding="utf-8-sig", errors="replace")
+    return open(path, encoding=encoding, errors="replace")
 
 
 def ensure_distinct(src: str, dst: str) -> None:
@@ -202,6 +229,9 @@ class Session:
     status: str | None = None
     partial: bool = False
     format: str = ""
+    usage: dict = field(default_factory=dict)
+    """Summed token counts from ``usage`` events (empty if none recorded):
+    ``input``, ``output``, ``cache_read``, ``cache_creation``, ``calls``."""
 
     @classmethod
     def load(
@@ -249,7 +279,29 @@ class Session:
         session._index()
         return session
 
+    def _add_usage(self, event: dict) -> None:
+        total = self.usage or {
+            "input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "calls": 0
+        }
+        for dst, src in (
+            ("input", "input_tokens"),
+            ("output", "output_tokens"),
+            ("cache_read", "cache_read_tokens"),
+            ("cache_creation", "cache_creation_tokens"),
+        ):
+            v = event.get(src)
+            if isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+                total[dst] += v
+        total["calls"] += 1
+        self.usage = total
+
+    @property
+    def total_tokens(self) -> int:
+        u = self.usage
+        return sum(u.get(k, 0) for k in ("input", "output", "cache_read", "cache_creation"))
+
     def _index(self) -> None:
+        self.usage = {}
         steps: list[Step] = []
         by_call_id: dict[str, Step] = {}
         pending_results: dict[str, dict] = {}
@@ -264,6 +316,8 @@ class Session:
                 self.meta = event.get("meta", {})
             elif etype == SESSION_END:
                 self.status = event.get("status")
+            elif etype == USAGE:
+                self._add_usage(event)
             elif etype == PROMPT:
                 last_prompt = event
             elif etype == RESPONSE:

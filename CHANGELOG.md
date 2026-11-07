@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.3.0 - unreleased (expert round 3)
+
+Round 3 panel: incident responder, red-team attacker, privacy/compliance
+auditor, Windows/cross-platform engineer, CI/DevOps engineer, performance
+engineer, new-user docs reviewer. Two full passes (build, then adversarial
+re-review of the new code).
+
+### Added
+- **`redbg audit TRACE`**: one pass over a whole session that ranks leads -
+  `invented_path` (high when the tool answered "not found"), `destructive`
+  (`rm -r`, `git reset --hard`, force push, SQL DROP/TRUNCATE, `curl | sh`,
+  PowerShell `Remove-Item -Recurse`, ...), `retried_failure`, `failure_streak`,
+  `loop`, `cycle`, `incomplete`, `secrets`. `--json`, `--min-severity`,
+  `--no-secrets`, `--strict` (exit 1 on a high finding).
+- **`check` policy rules**: `--forbid-path GLOB`, `--forbid-write GLOB`
+  (file ledger, shell commands included), `--forbid-arg REGEX`,
+  `--max-cycles N` (alternating loops of 2-8 calls), `--max-tokens N`
+  (fails closed without usage data).
+- **CI report formats**: `check --github` (workflow annotations, escaped so
+  trace text cannot forge a command) and `check --junit FILE`.
+- **Token usage**: new `usage` event; `Recorder.usage()`; Claude Code
+  transcripts are read per message id (the repeated usage on each content
+  block is counted once). `info` shows totals; `info --json` too.
+- `find_cycles` API; `info` reports alternating cycles.
+- `-` reads a trace from standard input; UTF-8 BOM, UTF-16 and UTF-32 files
+  (PowerShell `>`) and misnamed gzip open directly.
+- `redbg scan|redact --pii`: e-mail addresses and Luhn-valid card numbers.
+- ~20 more secret shapes (see README "Secrets and safety").
+- `info --json`.
+
+### Fixed
+- `--forbid-tool` / `--require-tool` missed namespaced names such as
+  `mcp__files__Delete_File`: each name is now also tried without its
+  `__`, `:`, `/` or `.` prefixes. **Behaviour change**: policies are
+  stricter (fail-closed) for namespaced tools.
+- Windows: `C:\dir\file` in shell commands lost its backslashes
+  (`C:dirfile`); drive letters and `blame` lookups are case-insensitive;
+  `cat a > b` reported `b` as a read; `git rm|mv|checkout --`, PowerShell
+  verbs (`Remove-Item`, `Set-Content`, `Copy-Item`...), `curl -o`, `wget -O`
+  now appear in `files`/`blame`; `$HOME/.env`-style paths are no longer
+  dropped.
+- Piping into `head` printed a `BrokenPipeError` traceback; now exits 141
+  quietly (never 0/1/2).
+- `redact` on a non-JSONL log gave a bare JSON error; now names the line and
+  points to `redbg import --redact`.
+- Diff of two long runs that start/end alike was super-linear (two identical
+  26,000-step runs: `check` took 29 s, measured on a loaded host); the common
+  head and tail are now trimmed before alignment (7 s, of which 3 s is loading).
+- Redaction pre-filter: each default pattern is only run when its required
+  literal is in the text (tested against a sample of every pattern, including
+  Unicode case tricks). `bench/bench.py` now deletes its ~200 MB inputs.
+- README quick-start output listed `rules: complete, baseline`; the real
+  output includes `non_empty`.
+
 ## 0.3.0 — unreleased
 
 Expert round 2 (agent-observability, transcript-format, security/privacy,

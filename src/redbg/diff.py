@@ -101,9 +101,30 @@ def align_steps(a: Session, b: Session, ignore_keys=()) -> list[AlignedRow]:
     ignore = frozenset(ignore_keys)
     sig_a = [step_signature(s, ignore) for s in a.steps]
     sig_b = [step_signature(s, ignore) for s in b.steps]
-    matcher = difflib.SequenceMatcher(None, sig_a, sig_b, autojunk=False)
+    # Runs usually start and end identically (that's the CI case: today vs the
+    # golden run). Align only the differing middle: SequenceMatcher is
+    # super-linear on long sequences of repeated calls, and two identical
+    # 25,000-step runs took half a minute without this.
+    na, nb = len(sig_a), len(sig_b)
+    head = 0
+    while head < na and head < nb and sig_a[head] == sig_b[head]:
+        head += 1
+    tail = 0
+    while tail < na - head and tail < nb - head and sig_a[na - 1 - tail] == sig_b[nb - 1 - tail]:
+        tail += 1
+    ops: list[tuple[str, int, int, int, int]] = []
+    if head:
+        ops.append(("equal", 0, head, 0, head))
+    if head < na - tail or head < nb - tail:
+        matcher = difflib.SequenceMatcher(
+            None, sig_a[head : na - tail], sig_b[head : nb - tail], autojunk=False
+        )
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            ops.append((tag, i1 + head, i2 + head, j1 + head, j2 + head))
+    if tail:
+        ops.append(("equal", na - tail, na, nb - tail, nb))
     rows: list[AlignedRow] = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+    for tag, i1, i2, j1, j2 in ops:
         if tag == "equal":
             for i, j in zip(range(i1, i2), range(j1, j2)):
                 sa, sb = a.steps[i], b.steps[j]
@@ -460,3 +481,67 @@ def find_repeats(session: Session, min_count: int = 2, ignore_keys=()) -> list[R
     if start is not None and len(steps) - start >= min_count:
         runs.append(Repeat(steps[start].tool, steps[start].n, steps[-1].n))
     return runs
+
+
+@dataclass
+class Cycle:
+    """A short call pattern (period >= 2) that repeats back-to-back."""
+
+    period: int
+    tools: tuple[str, ...]
+    first: int
+    last: int
+    reps: int
+
+
+def find_cycles(
+    session: Session,
+    min_reps: int = 3,
+    max_period: int = 8,
+    ignore_keys=(),
+) -> list[Cycle]:
+    """Find alternating loops such as ``read, edit, read, edit, ...``.
+
+    ``find_repeats`` only sees one call repeated back-to-back; stuck agents
+    just as often flip between two or three calls. A cycle of ``period``
+    calls (2..``max_period``) counts when the same signatures recur at least
+    ``min_reps`` times in a row. Patterns made of a smaller repeat (``a a a
+    a`` is a repeat, not a period-2 cycle) are left to ``find_repeats``.
+    Calls are compared on tool + canonical args, so a counter in the args
+    breaks a cycle: use ``ignore_keys`` for ids and timestamps.
+    """
+    ignore = frozenset(ignore_keys)
+    sigs = [step_signature(s, ignore) for s in session.steps]
+    n = len(sigs)
+    covered = [False] * n
+    found: list[Cycle] = []
+    for period in range(2, max_period + 1):
+        i = 0
+        while i + period < n:
+            if sigs[i] != sigs[i + period]:
+                i += 1
+                continue
+            j = i
+            while j + period < n and sigs[j] == sigs[j + period]:
+                j += 1
+            end = j + period - 1  # last step index covered by the pattern
+            window = sigs[i : i + period]
+            reps = (end - i + 1) // period
+            smaller = any(
+                period % q == 0 and window == window[:q] * (period // q)
+                for q in range(1, period)
+            )
+            if reps >= min_reps and not smaller and not all(covered[i : end + 1]):
+                for k in range(i, end + 1):
+                    covered[k] = True
+                found.append(
+                    Cycle(
+                        period,
+                        tuple(s.tool for s in session.steps[i : i + period]),
+                        session.steps[i].n,
+                        session.steps[end].n,
+                        reps,
+                    )
+                )
+            i = j + 1
+    return sorted(found, key=lambda c: c.first)

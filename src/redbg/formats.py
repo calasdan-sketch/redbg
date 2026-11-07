@@ -45,6 +45,7 @@ from .schema import (
     SESSION_START,
     TOOL_CALL,
     TOOL_RESULT,
+    USAGE,
     new_event,
 )
 
@@ -267,6 +268,7 @@ class _Builder:
         self.fmt = fmt
         self.step = 0
         self.calls: dict[str, dict] = {}
+        self.usage_seen: dict[str, dict[str, int]] = {}
         self.skipped: dict[str, int] = {}
         self.started = False
         self.last_mono = 0.0
@@ -323,6 +325,41 @@ class _Builder:
         ev = new_event(etype, text=text, **extra)
         if ts:
             ev["ts"] = ts if isinstance(ts, str) else str(ts)
+        ev["mono"] = self.mono(ts)
+        return ev
+
+    def usage_delta(self, message_id, usage, model, ts):
+        """A USAGE event with the *new* tokens of an assistant message.
+
+        Claude Code writes one line per content block of the same message,
+        each repeating that message's ``usage`` (sometimes still growing),
+        so the event carries only what exceeds what was already counted for
+        this message id: the session total stays right either way.
+        """
+        if not isinstance(usage, dict):
+            return None
+        names = {
+            "input_tokens": "input_tokens",
+            "output_tokens": "output_tokens",
+            "cache_read_input_tokens": "cache_read_tokens",
+            "cache_creation_input_tokens": "cache_creation_tokens",
+        }
+        now = {}
+        for src, dst in names.items():
+            v = usage.get(src)
+            now[dst] = v if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 10**12 else 0
+        key = message_id if isinstance(message_id, str) and message_id else None
+        before = self.usage_seen.get(key, {}) if key else {}
+        delta = {k: max(0, now[k] - before.get(k, 0)) for k in now}
+        if key:
+            self.usage_seen[key] = {k: max(now[k], before.get(k, 0)) for k in now}
+        if not any(delta.values()):
+            return None
+        ev = new_event(USAGE, **delta)
+        if isinstance(model, str):
+            ev["model"] = model
+        if isinstance(ts, str) and ts:
+            ev["ts"] = ts
         ev["mono"] = self.mono(ts)
         return ev
 
@@ -481,6 +518,12 @@ def iter_claude_code(path, builder: _Builder, state: dict):
             if not isinstance(msg, dict):
                 builder.skip(f"{t}-no-message")
                 continue
+            if t == "assistant":
+                uev = builder.usage_delta(
+                    msg.get("id"), msg.get("usage"), msg.get("model"), obj.get("timestamp")
+                )
+                if uev is not None:
+                    yield uev
             yield from _cc_blocks(builder, t, msg.get("content"), obj)
         elif t == "system":
             sub = obj.get("subtype")

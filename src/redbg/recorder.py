@@ -45,6 +45,7 @@ from .schema import (
     TOO_DEEP,
     TOOL_CALL,
     TOOL_RESULT,
+    USAGE,
     new_event,
 )
 
@@ -191,6 +192,32 @@ class Recorder:
         if model is not None:
             fields["model"] = model
         event = new_event(RESPONSE, **fields)
+        self._write(event)
+        return event["id"]
+
+    def usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+        model: str | None = None,
+    ) -> str:
+        """Record the tokens one model call used (counts add up per session).
+
+        ``redbg info`` shows the totals and ``redbg check --max-tokens N``
+        can fail a run that used more. Counts only: redbg does not price them.
+        """
+        fields: dict = {
+            "session_id": self.session_id,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "cache_creation_tokens": cache_creation_tokens,
+        }
+        if model is not None:
+            fields["model"] = model
+        event = new_event(USAGE, **fields)
         self._write(event)
         return event["id"]
 

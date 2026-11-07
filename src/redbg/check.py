@@ -13,15 +13,19 @@ to exit codes: 0 pass, 1 violations, 2 could not run.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
+from xml.etree import ElementTree as ET
 
-from ._text import canonical_name
+from ._text import canonical_name, clean, name_variants
+from .analysis import _path_matches, args_text, effects
 from .diff import (
     ALL_KINDS,
     CHANGE_KINDS,
     OUTPUT_CHANGED,
     align_steps,
+    find_cycles,
     find_divergence,
     find_repeats,
     output_changed,
@@ -45,6 +49,22 @@ class CheckRules:
     """Glob patterns; each must match at least one call (same matching)."""
     max_repeats: int | None = None
     """Max allowed run of identical consecutive calls (loop detector)."""
+    max_tokens: int | None = None
+    """Budget for input + output + cache-read + cache-creation tokens over
+    the whole session (counts, not cost). A trace with no usage data fails
+    this rule: an unmeasured run must not pass a budget."""
+    max_cycles: int | None = None
+    """Max allowed repeats of an alternating call pattern (``a, b, a, b``...)
+    of 2-8 calls; a pattern repeated more than this many times fails."""
+    forbid_paths: list[str] = field(default_factory=list)
+    """Path globs; a step that reads, writes or deletes a matching file fails.
+    Paths are those ``redbg files`` reports (shell commands are inferred)."""
+    forbid_writes: list[str] = field(default_factory=list)
+    """Like ``forbid_paths`` but only writes and deletes count."""
+    forbid_args: list[str] = field(default_factory=list)
+    """Regexes searched (case-insensitive) in each call's tool name and
+    arguments, e.g. ``rm\\s+-rf`` or ``git push.*--force``. Your regex runs
+    over every call: keep it simple."""
     fail_on: tuple[str, ...] = CHANGE_KINDS
     """Baseline diff kinds that count as a regression."""
     ignore_keys: tuple[str, ...] = ()
@@ -59,7 +79,14 @@ class CheckRules:
             raise ValueError(
                 f"unknown fail_on kind(s) {bad}; choose from {list(FAIL_ON_CHOICES)}"
             )
-        for name in ("max_steps", "max_failures", "max_repeats"):
+        for pattern in self.forbid_args:
+            if len(pattern) > 500:
+                raise ValueError("forbid_args pattern too long (max 500 chars)")
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"bad forbid_args regex {pattern!r}: {exc}") from None
+        for name in ("max_steps", "max_failures", "max_repeats", "max_cycles", "max_tokens"):
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be >= 0, got {value}")
@@ -102,7 +129,6 @@ def run_check(
     violations: list[Violation] = []
     checked: list[str] = []
     steps = candidate.steps
-    names = [canonical_name(s.tool) for s in steps]
 
     if not rules.allow_empty:
         checked.append("non_empty")
@@ -166,9 +192,10 @@ def run_check(
     if rules.forbid_tools:
         checked.append("forbid_tools")
         forbid = [(p, canonical_name(p)) for p in rules.forbid_tools]
-        for step, tool_name in zip(steps, names):
+        for step in steps:
+            variants = name_variants(step.tool)
             for pattern, canon in forbid:
-                if fnmatchcase(tool_name, canon):
+                if any(fnmatchcase(v, canon) for v in variants):
                     violations.append(
                         Violation(
                             "forbid_tools",
@@ -183,12 +210,57 @@ def run_check(
         checked.append("require_tools")
         for pattern in rules.require_tools:
             canon = canonical_name(pattern)
-            if not any(fnmatchcase(name, canon) for name in names):
+            if not any(
+                fnmatchcase(v, canon) for s in steps for v in name_variants(s.tool)
+            ):
                 violations.append(
                     Violation(
                         "require_tools", f"no call matched required tool {pattern!r}"
                     )
                 )
+
+    if rules.forbid_paths or rules.forbid_writes:
+        checked.append("forbid_paths")
+        for step in steps:
+            for eff in effects(step):
+                hit = next(
+                    (g for g in rules.forbid_paths if _path_matches(eff.path, g)), None
+                ) or (
+                    next(
+                        (g for g in rules.forbid_writes if _path_matches(eff.path, g)),
+                        None,
+                    )
+                    if eff.kind in ("write", "delete")
+                    else None
+                )
+                if hit:
+                    how = "inferred from a shell command" if eff.how == "inferred" else "declared"
+                    failed = " (the step failed, but it tried)" if step.ok is False else ""
+                    violations.append(
+                        Violation(
+                            "forbid_paths",
+                            f"step {step.n} ({step.tool}) {eff.kind}s {eff.path!r} "
+                            f"(matches {hit!r}; {how}){failed}",
+                            step.n,
+                        )
+                    )
+
+    if rules.forbid_args:
+        checked.append("forbid_args")
+        compiled = [(p, re.compile(p, re.I)) for p in rules.forbid_args]
+        for step in steps:
+            hay = canonical_name(step.tool + "\n" + args_text(step.args))
+            for pattern, rx in compiled:
+                if rx.search(hay):
+                    violations.append(
+                        Violation(
+                            "forbid_args",
+                            f"step {step.n} ({step.tool}) matches forbidden "
+                            f"pattern {pattern!r}",
+                            step.n,
+                        )
+                    )
+                    break
 
     if rules.max_repeats is not None:
         checked.append("max_repeats")
@@ -201,6 +273,44 @@ def run_check(
                         f"args (steps {run.first}-{run.last}); limit "
                         f"{rules.max_repeats} — possible loop",
                         run.first,
+                    )
+                )
+
+    if rules.max_tokens is not None:
+        checked.append("max_tokens")
+        if not candidate.usage:
+            violations.append(
+                Violation(
+                    "max_tokens",
+                    "no token usage in this trace, so the budget cannot be "
+                    "checked (Claude Code transcripts and Recorder.usage() "
+                    "provide it)",
+                )
+            )
+        elif candidate.total_tokens > rules.max_tokens:
+            u = candidate.usage
+            violations.append(
+                Violation(
+                    "max_tokens",
+                    f"{candidate.total_tokens:,} tokens > budget of "
+                    f"{rules.max_tokens:,} (input {u['input']:,}, output "
+                    f"{u['output']:,}, cache read {u['cache_read']:,}, cache "
+                    f"creation {u['cache_creation']:,})",
+                )
+            )
+
+    if rules.max_cycles is not None:
+        checked.append("max_cycles")
+        for cyc in find_cycles(candidate, min_reps=2, ignore_keys=rules.ignore_keys):
+            if cyc.reps > rules.max_cycles:
+                shape = " -> ".join(cyc.tools)
+                violations.append(
+                    Violation(
+                        "max_cycles",
+                        f"pattern [{shape}] repeated {cyc.reps}× "
+                        f"(steps {cyc.first}-{cyc.last}); limit "
+                        f"{rules.max_cycles} — possible loop",
+                        cyc.first,
                     )
                 )
 
@@ -246,7 +356,73 @@ def run_check(
     )
 
 
+def to_github(result: CheckResult, limit: int = 0) -> str:
+    """GitHub Actions workflow commands, one ``::error`` per violation.
+
+    Violation text comes from untrusted traces, so it is made printable and
+    escaped the way the runner requires (``%``, CR and LF in the message;
+    also ``:`` and ``,`` in properties) - a tool name containing a newline
+    can't forge a second workflow command.
+    """
+
+    def esc(text: str) -> str:
+        return (
+            clean(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        )
+
+    title = "redbg check"
+    lines = []
+    shown = result.violations[:limit] if limit > 0 else result.violations
+    for v in shown:
+        rule = esc(v.rule).replace(":", "%3A").replace(",", "%2C")
+        lines.append(f"::error title={title} [{rule}]::{esc(v.message)}")
+    if len(shown) < len(result.violations):
+        lines.append(
+            f"::error title={title}::{len(result.violations) - len(shown)} more "
+            "violation(s) not shown (--limit 0 shows all)"
+        )
+    if not lines:
+        lines.append("::notice title=redbg check::passed")
+    return "\n".join(lines)
+
+
+_XML_BAD = re.compile("[^\t\n\r\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+
+
+def _xml_text(text) -> str:
+    """Printable text that is also legal XML 1.0 (no U+FFFE/U+FFFF etc.)."""
+    return _XML_BAD.sub(lambda m: f"\\u{ord(m.group()):04x}", clean(text))
+
+
+def to_junit(result: CheckResult) -> str:
+    """JUnit XML: one test case per rule checked, failures carry the messages."""
+    by_rule: dict[str, list[Violation]] = {}
+    for v in result.violations:
+        by_rule.setdefault(v.rule, []).append(v)
+    rules = list(dict.fromkeys([*result.checked, *by_rule]))
+    suite = ET.Element(
+        "testsuite",
+        name="redbg check",
+        tests=str(len(rules)),
+        failures=str(len(by_rule)),
+    )
+    for rule in rules:
+        case = ET.SubElement(
+            suite, "testcase", classname="redbg", name=_xml_text(rule)
+        )
+        if rule in by_rule:
+            msgs = [_xml_text(v.message) for v in by_rule[rule]]
+            ET.SubElement(
+                case, "failure", message=msgs[0], type=_xml_text(rule)
+            ).text = "\n".join(msgs)
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(
+        suite, encoding="unicode"
+    )
+
+
 __all__ = [
+    "to_github",
+    "to_junit",
     "ALL_KINDS",
     "FAIL_ON_CHOICES",
     "CheckRules",

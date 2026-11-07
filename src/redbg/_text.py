@@ -63,6 +63,26 @@ def canonical_name(name) -> str:
     return text.casefold()
 
 
+_NAMESPACE_SEP_RE = re.compile(r"__|[:/.]")
+
+
+def name_variants(name) -> list[str]:
+    """A tool name plus every namespace-stripped suffix of it, canonicalized.
+
+    MCP and plugin hosts prefix tool names (``mcp__files__Delete_File``,
+    ``files/delete_file``, ``server:delete_file``). A policy written for
+    ``delete_*`` must still catch them, so matching tries the full name and
+    each suffix after a ``__``, ``:``, ``/`` or ``.`` separator.
+    """
+    canon = canonical_name(name)
+    variants = [canon]
+    for match in _NAMESPACE_SEP_RE.finditer(canon):
+        tail = canon[match.end() :]
+        if tail and tail not in variants:
+            variants.append(tail)
+    return variants
+
+
 def md_fence(text: str, lang: str = "") -> str:
     """Wrap ``text`` in a Markdown code fence it cannot break out of.
 

@@ -58,10 +58,21 @@ class Effect:
     ok: bool | None
 
 
+_WIN_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\[^\\/])")
+
+
+def _is_windows_path(path: str) -> bool:
+    return bool(_WIN_PATH_RE.match(path)) or (
+        "\\" in path and "/" not in path
+    )
+
+
 def _norm_path(path: str) -> str:
     path = path.strip().strip("\"'")
-    if "\\" in path and "/" not in path:
-        path = path.replace("\\", "/")  # Windows paths
+    if _is_windows_path(path):
+        path = path.replace("\\", "/")
+        if re.match(r"^[A-Za-z]:", path):
+            path = path[0].upper() + path[1:]  # drive letters are case-insensitive
     path = posixpath.normpath(path) if path else path
     return path
 
@@ -74,13 +85,30 @@ def _first_str(args: dict, keys) -> str | None:
     return None
 
 
+_PS_DELETE = frozenset("remove-item ri del erase rd rmdir rm".split())
+_PS_WRITE_FIRST = frozenset(
+    "set-content add-content out-file new-item ni sc ac".split()
+)
+_PS_READ = frozenset("get-content gc type cat".split())
+_PS_COPY = frozenset("copy-item copy cp".split())
+_PS_MOVE = frozenset("move-item move mv".split())
+_OUTPUT_FLAGS = {"curl": ("-o", "--output"), "wget": ("-o", "-O", "--output-document")}
+
+
 def _shell_effects(command: str) -> list[tuple[str, str]]:
-    """Conservative (kind, path) pairs from a shell command string."""
+    """Conservative (kind, path) pairs from a shell command string.
+
+    Understands POSIX shells and the common cmd.exe / PowerShell verbs.
+    Windows-looking commands (a drive letter or UNC path) are read with
+    backslashes treated as path separators, not escapes.
+    """
     out: list[tuple[str, str]] = []
     if not isinstance(command, str) or len(command) > 20_000:
         return out
     # split on control operators so each simple command is analysed alone
     for part in re.split(r"&&|\|\||;|\n|\|(?!\|)", command):
+        if re.search(r"(?:^|[\s\"'=(])[A-Za-z]:\\|\\\\[A-Za-z0-9_.$-]", part):
+            part = part.replace("\\", "/")
         try:
             toks = shlex.split(part, posix=True)
         except ValueError:
@@ -88,6 +116,7 @@ def _shell_effects(command: str) -> list[tuple[str, str]]:
         if not toks:
             continue
         i = 0
+        args = []
         while i < len(toks):
             t = toks[i]
             m = re.fullmatch(r"(?:\d?>>?|&>>?)(.*)", t)
@@ -95,32 +124,55 @@ def _shell_effects(command: str) -> list[tuple[str, str]]:
                 target = m.group(1) or (toks[i + 1] if i + 1 < len(toks) else "")
                 if target and not target.startswith("&") and target != "/dev/null":
                     out.append(("write", target))
-                    i += 1 if m.group(1) else 2
-                    continue
+                i += 1 if m.group(1) else 2  # skip the operator and its target
+                continue
+            args.append(t)
             i += 1
-        args = [t for t in toks if not re.match(r"^\d?>>?|^&>", t)]
         # drop leading env assignments and sudo
         while args and (re.match(r"^\w+=", args[0]) or args[0] in ("sudo", "time")):
             args = args[1:]
         if not args:
             continue
-        cmd = posixpath.basename(args[0])
+        cmd = posixpath.basename(args[0]).lower()
+        if cmd.endswith(".exe"):
+            cmd = cmd[:-4]
+        if cmd == "git" and len(args) > 1:
+            sub = args[1].lower()
+            grest = [a for a in args[2:] if not a.startswith("-") and a != "--"]
+            if sub == "rm":
+                out += [("delete", a) for a in grest]
+            elif sub == "mv" and len(grest) >= 2:
+                out += [("delete", a) for a in grest[:-1]] + [("write", grest[-1])]
+            elif sub in ("restore", "checkout") and "--" in args:
+                out += [("write", a) for a in args[args.index("--") + 1 :]]
+            elif sub == "add":
+                out += [("read", a) for a in grest]
+            continue
+        flags = _OUTPUT_FLAGS.get(cmd)
+        if flags:
+            for k, a in enumerate(args[1:-1], start=1):
+                if a in flags:
+                    out.append(("write", args[k + 1]))
         rest = [a for a in args[1:] if not a.startswith("-")]
         if cmd == "tee":
             out += [("write", a) for a in rest]
-        elif cmd == "rm":
+        elif cmd in _PS_DELETE:
             out += [("delete", a) for a in rest]
-        elif cmd == "touch":
-            out += [("write", a) for a in rest]
-        elif cmd == "mv" and len(rest) >= 2:
+        elif cmd == "touch" or cmd in _PS_WRITE_FIRST:
+            out += [("write", a) for a in (rest if cmd == "touch" else rest[:1])]
+        elif cmd in _PS_MOVE and len(rest) >= 2:
             out += [("delete", a) for a in rest[:-1]] + [("write", rest[-1])]
-        elif cmd == "cp" and len(rest) >= 2:
+        elif cmd in _PS_COPY and len(rest) >= 2:
             out += [("read", a) for a in rest[:-1]] + [("write", rest[-1])]
         elif cmd == "sed" and any(a.startswith("-i") for a in args[1:]) and rest:
             out.append(("write", rest[-1]))
-        elif cmd in ("cat", "head", "tail", "less", "wc", "grep", "rg") and rest:
+        elif (
+            cmd in ("cat", "head", "tail", "less", "wc", "grep", "rg", "type")
+            or cmd in _PS_READ
+        ) and rest:
             out += [("read", a) for a in rest[-1:] if "/" in a or "." in a]
-    return [(k, p) for k, p in out if p and not p.startswith("$")]
+    # A bare variable (`$FILE`) names nothing we can match; `$HOME/.env` does.
+    return [(k, p) for k, p in out if p and not (p.startswith("$") and "/" not in p)]
 
 
 def effects(step) -> list[Effect]:
@@ -177,6 +229,23 @@ def _walk_strings(obj, depth: int = 0):
             yield from _walk_strings(v, depth + 1)
 
 
+def args_text(args, limit: int = 200_000) -> str:
+    """Every string in a call's arguments, newline-joined, as plain text.
+
+    Policy regexes (`--forbid-arg`, the audit's destructive patterns) should
+    see the command as written (`C:\\Users`, real newlines), not as a JSON
+    encoding of it with doubled backslashes and `\\n` escapes.
+    """
+    out: list[str] = []
+    size = 0
+    for text in _walk_strings(args):
+        out.append(text)
+        size += len(text)
+        if size > limit:
+            break
+    return "\n".join(out)[:limit]
+
+
 def file_ledger(session) -> dict[str, list[Effect]]:
     """Path -> ordered effects across the whole session."""
     ledger: dict[str, list[Effect]] = {}
@@ -188,11 +257,16 @@ def file_ledger(session) -> dict[str, list[Effect]]:
 
 def _path_matches(candidate: str, query: str) -> bool:
     q = _norm_path(query)
+    if q.startswith("~/"):
+        q = "*/" + q[2:]  # a policy about ~/.ssh must catch /home/x/.ssh too
+    if _WIN_PATH_RE.match(candidate) or _WIN_PATH_RE.match(q):
+        # Windows file systems are case-insensitive by default.
+        candidate, q = candidate.casefold(), q.casefold()
     if candidate == q:
         return True
     if not q.startswith("/") and candidate.endswith("/" + q):
         return True
-    return fnmatch.fnmatch(candidate, q) or fnmatch.fnmatch(candidate, "*/" + q)
+    return fnmatch.fnmatchcase(candidate, q) or fnmatch.fnmatchcase(candidate, "*/" + q)
 
 
 def blame(session, path: str) -> list[Effect]:

@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -72,6 +73,13 @@ def main() -> None:
     args = ap.parse_args()
 
     work = tempfile.mkdtemp(prefix="redbg-bench-")
+    try:
+        run(args, work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)  # the inputs are ~200 MB
+
+
+def run(args, work) -> None:
     cc = os.path.join(work, "claude-code.jsonl")
     nat = os.path.join(work, "native.jsonl")
     ci = gen.gen_claude_code(cc, args.mb * 1024 * 1024)
@@ -92,7 +100,15 @@ def main() -> None:
             ttfv = best(lambda: run_cli(src, ["replay", path, "--show", "1"]))  # noqa: B023
             mid = str(info["steps"] // 2)
             why = best(lambda: run_cli(src, ["why", path, mid]), 1)  # noqa: B023
-            rows.append((label, name, info, res, ttfv, why))
+            # `audit` and `check` commands are newer than old baseline refs, which show "-".
+            aud = best(lambda: run_cli(src, ["audit", path, "--no-color"]), 1)  # noqa: B023
+            chk = best(  # noqa: B023
+                lambda: run_cli(
+                    src, ["check", path, "--baseline", path, "--max-cycles", "99"]  # noqa: B023
+                ),
+                1,
+            )
+            rows.append((label, name, info, res, ttfv, why, aud, chk))
 
     lines = [
         f"# Benchmark ({args.mb} MB inputs)",
@@ -101,15 +117,25 @@ def main() -> None:
         "best of 3 for time-to-first-view, single run for load. Re-run: "
         "`python bench/bench.py`.",
         "",
-        "| version | input | file MB | steps | full load | peak memory | time to first view | `why` (mid-step) |",
-        "|---|---|---|---|---|---|---|---|",
+        "Host load average (1/5/15 min) at the end of the run: "
+        + (
+            "/".join(f"{x:.1f}" for x in os.getloadavg())
+            if hasattr(os, "getloadavg")
+            else "n/a"
+        )
+        + ". Absolute times scale with it; compare rows within one table.",
+        "",
+        "| version | input | file MB | steps | full load | peak memory | time to first view | `why` (mid-step) | `audit` | `check` vs itself |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
-    for label, name, info, res, ttfv, why in rows:
+    for label, name, info, res, ttfv, why, aud, chk in rows:
         lines.append(
             f"| {label} | {name} | {info['bytes'] / 1e6:.0f} | {info['steps']} | "
             f"{fmt(res['load_s']) if res else 'cannot open'} | "
             f"{fmt(res['rss_mb'], 'MB', 0) if res else '-'} | {fmt(ttfv)} | "
-            f"{fmt(why) if label == 'current' else '-'} |"
+            f"{fmt(why) if label == 'current' else '-'} | "
+            f"{fmt(aud) if aud is not None else '-'} | "
+            f"{fmt(chk) if chk is not None else '-'} |"
         )
     text = "\n".join(lines) + "\n"
     with open(args.out, "w", encoding="utf-8") as fh:

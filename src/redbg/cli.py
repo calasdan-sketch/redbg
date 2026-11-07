@@ -10,6 +10,8 @@ Subcommands:
   info TRACE          session summary
   import SRC -o DST   convert Claude Code / Codex / chat-message / OTel logs
   why TRACE N         why did the agent make call N? (causal chain)
+  audit TRACE         rank the suspicious steps (invented paths, destructive
+                      commands, loops, secrets)
   files TRACE         which files each step read / wrote / deleted
   blame TRACE PATH    which steps touched PATH
 
@@ -20,21 +22,25 @@ OpenAI/Anthropic message logs directly (format auto-detected).
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
 import runpy
+import shutil
 import sys
+import tempfile
 
 from . import __version__
 from ._text import clean, md_fence
 from .analysis import Breakpoint, blame, explain, file_ledger, run_to_breakpoint
-from .check import FAIL_ON_CHOICES, CheckRules, run_check
-from .diff import diff_to_dict, find_repeats, render_diff
+from .audit import audit
+from .check import FAIL_ON_CHOICES, CheckRules, run_check, to_github, to_junit
+from .diff import diff_to_dict, find_cycles, find_repeats, render_diff
 from .fork import ForkSpec, fork_session
 from .htmlexport import render_html
 from .importer import import_file
-from .redact import redact_file, scan_file
+from .redact import DEFAULT_VALUE_RES, PII_VALUE_RES, redact_file, scan_file
 from .replay import Navigator, Session, ensure_distinct
 
 BOLD = "\033[1m"
@@ -142,6 +148,13 @@ def render_info(session: Session, color: bool) -> str:
         "  tools:      "
         + ", ".join(f"{clean(name)}×{count}" for name, count in sorted(tools.items())),
     ]
+    if session.usage:
+        u = session.usage
+        lines.append(
+            f"  tokens:     {u['input']:,} in, {u['output']:,} out, "
+            f"{u['cache_read']:,} cache read, {u['cache_creation']:,} cache "
+            f"write ({u['calls']} model call(s); counts, not cost)"
+        )
     repeats = find_repeats(session)
     if repeats:
         worst = max(repeats, key=lambda r: r.count)
@@ -150,6 +163,18 @@ def render_info(session: Session, color: bool) -> str:
                 f"  repeats:    {len(repeats)} run(s) of identical consecutive calls; "
                 f"longest {clean(worst.tool)}×{worst.count} "
                 f"(steps {worst.first}-{worst.last}) — possible loop",
+                YELLOW,
+                color,
+            )
+        )
+    cycles = find_cycles(session)
+    if cycles:
+        worst_c = max(cycles, key=lambda c: c.reps)
+        lines.append(
+            _c(
+                f"  cycles:     {len(cycles)} alternating pattern(s); longest "
+                f"[{clean(' -> '.join(worst_c.tools))}]×{worst_c.reps} "
+                f"(steps {worst_c.first}-{worst_c.last}) — possible loop",
                 YELLOW,
                 color,
             )
@@ -604,6 +629,37 @@ def cmd_why(args) -> int:
     return 0
 
 
+def cmd_audit(args) -> int:
+    session = _load_or_fail(args, redact=args.redact)
+    if session is None:
+        return 2
+    findings = audit(session, check_secrets=not args.no_secrets)
+    order = {"high": 0, "medium": 1, "low": 2}
+    findings = [f for f in findings if order[f.severity] <= order[args.min_severity]]
+    if args.json:
+        print(json.dumps([f.to_dict() for f in findings], indent=2))
+    else:
+        color = _color_enabled() and not args.no_color
+        if not findings:
+            print(_c("audit: nothing suspicious found", GREEN, color))
+        else:
+            print(_c(f"audit: {len(findings)} finding(s) in {clean(session.path)}", BOLD, color))
+            shown = findings[: args.limit] if args.limit > 0 else findings
+            for f in shown:
+                tint = RED if f.severity == "high" else YELLOW if f.severity == "medium" else DIM
+                where = f"step {f.step}" if f.step else "session"
+                print(
+                    f"  {_c(f.severity.upper().ljust(6), tint, color)} "
+                    f"{f.kind:<15} {where:<9} {clean(f.message)}"
+                )
+            if len(shown) < len(findings):
+                print(_c(f"  … {len(findings) - len(shown)} more (use --limit 0)", DIM, color))
+            print(_c("  leads, not verdicts: check with `redbg why TRACE N`", DIM, color))
+    if args.strict and any(f.severity == "high" for f in findings):
+        return 1
+    return 0
+
+
 def cmd_files(args) -> int:
     session = _load_or_fail(args, redact=args.redact)
     if session is None:
@@ -665,6 +721,11 @@ def cmd_check(args) -> int:
             forbid_tools=list(_split_csv(args.forbid_tool)),
             require_tools=list(_split_csv(args.require_tool)),
             max_repeats=args.max_repeats,
+            max_cycles=args.max_cycles,
+            max_tokens=args.max_tokens,
+            forbid_paths=list(_split_csv(args.forbid_path)),
+            forbid_writes=list(_split_csv(args.forbid_write)),
+            forbid_args=list(args.forbid_arg or []),
             ignore_keys=_split_csv(args.ignore_keys),
             allow_empty=args.allow_empty,
             **({"fail_on": fail_on} if fail_on else {}),
@@ -673,6 +734,16 @@ def cmd_check(args) -> int:
         print(f"redbg: {exc}", file=sys.stderr)
         return 2
     result = run_check(candidate, rules, baseline)
+    if args.junit:
+        try:
+            with open(args.junit, "w", encoding="utf-8") as handle:
+                handle.write(to_junit(result))
+        except OSError as exc:
+            print(f"redbg: cannot write --junit report: {exc}", file=sys.stderr)
+            return 2
+    if args.github:
+        print(to_github(result, args.limit))
+        return 0 if result.passed else 1
     if args.json:
         print(json.dumps(result.to_dict(), indent=2, default=str))
         return 0 if result.passed else 1
@@ -758,9 +829,13 @@ def cmd_fork(args) -> int:
     return 0
 
 
+def _value_res(args):
+    return DEFAULT_VALUE_RES + (PII_VALUE_RES if getattr(args, "pii", False) else [])
+
+
 def cmd_redact(args) -> int:
     try:
-        stats = redact_file(args.src, args.dst)
+        stats = redact_file(args.src, args.dst, value_res=_value_res(args))
     except (ValueError, OSError) as exc:
         print(f"redbg: {exc}", file=sys.stderr)
         return 2
@@ -773,7 +848,7 @@ def cmd_redact(args) -> int:
 
 def cmd_scan(args) -> int:
     try:
-        findings = scan_file(args.trace)
+        findings = scan_file(args.trace, value_res=_value_res(args))
     except (ValueError, OSError) as exc:
         print(f"redbg: {exc}", file=sys.stderr)
         return 2
@@ -792,12 +867,41 @@ def cmd_scan(args) -> int:
     return 1
 
 
+def info_to_dict(session: Session) -> dict:
+    tools: dict[str, int] = {}
+    failed = 0
+    total_ms = 0.0
+    for step in session.steps:
+        tools[step.tool] = tools.get(step.tool, 0) + 1
+        failed += step.ok is False
+        total_ms += step.duration_ms or 0.0
+    return {
+        "path": session.path,
+        "format": session.format,
+        "agent": session.agent,
+        "session_id": session.session_id,
+        "status": session.status,
+        "steps": len(session.steps),
+        "failed": failed,
+        "tool_time_ms": total_ms,
+        "prompts": len(session.prompts),
+        "responses": len(session.responses),
+        "tools": tools,
+        "usage": session.usage or None,
+        "repeats": [vars(r) for r in find_repeats(session)],
+        "cycles": [vars(c) for c in find_cycles(session)],
+    }
+
+
 def cmd_info(args) -> int:
     try:
         session = Session.load(args.trace, skip_bad=args.skip_bad)
     except (ValueError, OSError) as exc:
         print(f"redbg: {exc}", file=sys.stderr)
         return 2
+    if args.json:
+        print(json.dumps(info_to_dict(session), indent=2, default=str))
+        return 0
     print(render_info(session, _color_enabled() and not args.no_color))
     return 0
 
@@ -836,6 +940,9 @@ def _add_common(parser) -> None:
         action="store_true",
         help="redact secrets from everything shown (nothing is written)",
     )
+
+
+_PII_HELP = "also treat e-mail addresses and Luhn-valid card numbers as sensitive"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -913,6 +1020,41 @@ def build_parser() -> argparse.ArgumentParser:
         "with identical args (loop detector)",
     )
     p.add_argument(
+        "--max-tokens",
+        type=int,
+        metavar="N",
+        help="fail if the session used more than N tokens (input + output + "
+        "cache read + cache creation; counts, not cost); needs usage data",
+    )
+    p.add_argument(
+        "--max-cycles",
+        type=int,
+        metavar="N",
+        help="fail if an alternating pattern of 2-8 calls (a,b,a,b...) repeats "
+        "more than N times",
+    )
+    p.add_argument(
+        "--forbid-path",
+        action="append",
+        metavar="GLOB",
+        help="fail if a step reads, writes or deletes a matching file "
+        "(e.g. '.env', '*/secrets/*'); repeatable",
+    )
+    p.add_argument(
+        "--forbid-write",
+        action="append",
+        metavar="GLOB",
+        help="like --forbid-path but only writes and deletes count; repeatable",
+    )
+    p.add_argument(
+        "--forbid-arg",
+        action="append",
+        metavar="REGEX",
+        help="fail if a call's tool name or arguments match (case-insensitive), "
+        "e.g. 'rm\\s+-rf' or 'git push.*--force'; repeatable (commas are "
+        "kept: one pattern per flag)",
+    )
+    p.add_argument(
         "--forbid-tool",
         action="append",
         metavar="GLOB",
@@ -931,6 +1073,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="accept a trace with zero tool steps / a check with no rules",
     )
     p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument(
+        "--github",
+        action="store_true",
+        help="print GitHub Actions ::error annotations instead of the text report",
+    )
+    p.add_argument(
+        "--junit",
+        metavar="FILE",
+        help="also write a JUnit XML report (one test case per rule) to FILE",
+    )
     p.add_argument(
         "--limit", type=int, default=50, help="max violations to print (0 = all)"
     )
@@ -973,16 +1125,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("redact", help="strip secrets from a trace")
     p.add_argument("src")
     p.add_argument("-o", "--dst", required=True)
+    p.add_argument("--pii", action="store_true", help=_PII_HELP)
     _add_common(p)
     p.set_defaults(func=cmd_redact)
 
     p = sub.add_parser("scan", help="audit a trace for likely secrets")
     p.add_argument("trace")
+    p.add_argument("--pii", action="store_true", help=_PII_HELP)
     _add_common(p)
     p.set_defaults(func=cmd_scan)
 
     p = sub.add_parser("info", help="summarize a session")
     p.add_argument("trace")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
     _add_common(p)
     p.set_defaults(func=cmd_info)
 
@@ -1002,6 +1157,22 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(p)
     p.set_defaults(func=cmd_why)
 
+    p = sub.add_parser(
+        "audit",
+        help="rank the suspicious steps: invented paths, destructive commands, loops",
+    )
+    p.add_argument("trace")
+    p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--min-severity", choices=["high", "medium", "low"], default="low",
+        help="hide findings below this severity",
+    )
+    p.add_argument("--limit", type=int, default=50, help="max findings (0 = all)")
+    p.add_argument("--no-secrets", action="store_true", help="skip the credential scan")
+    p.add_argument("--strict", action="store_true", help="exit 1 if any high finding")
+    _add_common(p)
+    p.set_defaults(func=cmd_audit)
+
     p = sub.add_parser("files", help="files each step read / wrote / deleted")
     p.add_argument("trace")
     p.add_argument("--json", action="store_true")
@@ -1017,11 +1188,47 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _materialize_stdin(args) -> None:
+    """Replace a ``-`` trace argument with a temp copy of standard input.
+
+    Traces are read more than once (format sniffing, then loading), so a
+    pipe has to be spooled to a file first. The copy lives in a private
+    temp directory and is removed at exit.
+    """
+    names = [n for n in ("trace", "a", "b", "baseline", "src") if getattr(args, n, None) == "-"]
+    if not names:
+        return
+    if len(names) > 1:
+        raise ValueError("only one input can be read from standard input ('-')")
+    tmp = tempfile.mkdtemp(prefix="redbg-stdin-")
+    atexit.register(shutil.rmtree, tmp, True)
+    path = os.path.join(tmp, "stdin")
+    with open(path, "wb") as out:
+        shutil.copyfileobj(sys.stdin.buffer, out)
+    setattr(args, names[0], path)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        _materialize_stdin(args)
         return args.func(args)
+    except ValueError as exc:
+        if "standard input" not in str(exc):
+            raise
+        print(f"redbg: {exc}", file=sys.stderr)
+        return 2
+    except BrokenPipeError:
+        # `redbg ... | head`: the reader left. Point stdout at devnull so the
+        # interpreter's exit-time flush doesn't raise again, and exit with the
+        # conventional SIGPIPE status (never 0/1/2, which mean pass/violations/
+        # could-not-run).
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, ValueError):
+            pass
+        return 141
     except RecursionError:
         # A pathologically nested trace (or tool result) — "could not run",
         # never a traceback and never exit 1 (which means "violations").

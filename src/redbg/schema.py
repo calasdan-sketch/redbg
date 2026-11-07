@@ -26,10 +26,11 @@ RESPONSE = "response"
 TOOL_CALL = "tool_call"
 TOOL_RESULT = "tool_result"
 NOTE = "note"
+USAGE = "usage"
 SESSION_END = "session_end"
 
 EVENT_TYPES = frozenset(
-    {SESSION_START, PROMPT, RESPONSE, TOOL_CALL, TOOL_RESULT, NOTE, SESSION_END}
+    {SESSION_START, PROMPT, RESPONSE, TOOL_CALL, TOOL_RESULT, NOTE, USAGE, SESSION_END}
 )
 
 # Fields every event carries.
@@ -43,6 +44,7 @@ _REQUIRED = {
     TOOL_CALL: ("step", "tool", "args"),
     TOOL_RESULT: ("step", "call_id", "tool", "ok"),
     NOTE: ("text",),
+    USAGE: ("input_tokens", "output_tokens"),
     SESSION_END: ("status",),
 }
 
