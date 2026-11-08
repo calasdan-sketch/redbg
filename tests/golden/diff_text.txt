@@ -1,0 +1,9 @@
+✗ First divergence at A:— / B:1: step added in B ('read_file')
+
+    A      B     tool (A → B)                  note
+───────────────────────────────────────────────────────────────────────
+    —      1  +  read_file                     added in B
+    1      2  =  read_file                     output same
+    2      3  =  write_file                    output same
+
+A: 2 steps · B: 3 steps · same 2, args-changed 0, tool-changed 0, status-changed 0, removed 0, added 1

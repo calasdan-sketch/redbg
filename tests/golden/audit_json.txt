@@ -1,0 +1,8 @@
+[
+  {
+    "severity": "high",
+    "kind": "invented_path",
+    "step": 1,
+    "message": "read_file: 'wrong.py' appears nowhere the agent had seen and the call failed with a not-found error"
+  }
+]

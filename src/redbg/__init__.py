@@ -24,6 +24,7 @@ from .replay import Navigator, Session, Step
 from .schema import SCHEMA_VERSION
 
 __version__ = "0.3.0"
+__author__ = "Calas Automations Inc."
 
 __all__ = [
     "Breakpoint",
@@ -55,4 +56,5 @@ __all__ = [
     "redact_file",
     "scan_file",
     "__version__",
+    "__author__",
 ]

@@ -117,7 +117,10 @@ def run(args, work) -> None:
                 ),
                 1,
             )
-            rows.append((label, name, info, res, ttfv, why, aud, chk))
+            # `otel` and `digest` are new in round 5: older refs show "-".
+            otl = best(lambda: run_cli(src, ["otel", path, "-o", os.devnull]), 1)  # noqa: B023
+            dig = best(lambda: run_cli(src, ["digest", path]), 1)  # noqa: B023
+            rows.append((label, name, info, res, ttfv, why, aud, chk, otl, dig))
 
     lines = [
         f"# Benchmark ({args.mb} MB inputs)",
@@ -134,17 +137,19 @@ def run(args, work) -> None:
         )
         + ". Absolute times scale with it; compare rows within one table.",
         "",
-        "| version | input | file MB | steps | full load | peak memory | time to first view | `why` (mid-step) | `audit` | `check` vs itself |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| version | input | file MB | steps | full load | peak memory | time to first view | `why` (mid-step) | `audit` | `check` vs itself | `otel` | `digest` |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
-    for label, name, info, res, ttfv, why, aud, chk in rows:
+    for label, name, info, res, ttfv, why, aud, chk, otl, dig in rows:
         lines.append(
             f"| {label} | {name} | {info['bytes'] / 1e6:.0f} | {info['steps']} | "
             f"{fmt(res['load_s']) if res else 'cannot open'} | "
             f"{fmt(res['rss_mb'], 'MB', 0) if res else '-'} | {fmt(ttfv)} | "
             f"{fmt(why) if why is not None else '-'} | "
             f"{fmt(aud) if aud is not None else '-'} | "
-            f"{fmt(chk) if chk is not None else '-'} |"
+            f"{fmt(chk) if chk is not None else '-'} | "
+            f"{fmt(otl) if otl is not None else '-'} | "
+            f"{fmt(dig) if dig is not None else '-'} |"
         )
     text = "\n".join(lines) + "\n"
     with open(args.out, "w", encoding="utf-8") as fh:

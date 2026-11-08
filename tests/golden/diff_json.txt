@@ -1,0 +1,71 @@
+{
+  "a": {
+    "path": "sample-a.jsonl",
+    "steps": 2
+  },
+  "b": {
+    "path": "sample-b.jsonl",
+    "steps": 3
+  },
+  "identical": false,
+  "divergence": {
+    "a_n": null,
+    "b_n": 1,
+    "kind": "added",
+    "headline": "First divergence at A:\u2014 / B:1: step added in B ('read_file')",
+    "detail": ""
+  },
+  "counts": {
+    "same": 2,
+    "args_changed": 0,
+    "tool_changed": 0,
+    "status_changed": 0,
+    "added": 1,
+    "removed": 0
+  },
+  "rows": [
+    {
+      "kind": "added",
+      "a": null,
+      "b": {
+        "n": 1,
+        "tool": "read_file",
+        "ok": false,
+        "output_sha256": null
+      },
+      "output_changed": false
+    },
+    {
+      "kind": "same",
+      "a": {
+        "n": 1,
+        "tool": "read_file",
+        "ok": true,
+        "output_sha256": "7678d47f5bae84285614846312e524e50a1441673cfbf801c1921441411f14c0"
+      },
+      "b": {
+        "n": 2,
+        "tool": "read_file",
+        "ok": true,
+        "output_sha256": "7678d47f5bae84285614846312e524e50a1441673cfbf801c1921441411f14c0"
+      },
+      "output_changed": false
+    },
+    {
+      "kind": "same",
+      "a": {
+        "n": 2,
+        "tool": "write_file",
+        "ok": true,
+        "output_sha256": "bc88a61daa13dd9cd828d857ac616371b0e5e82dbe23286564be2c5c9bc56924"
+      },
+      "b": {
+        "n": 3,
+        "tool": "write_file",
+        "ok": true,
+        "output_sha256": "bc88a61daa13dd9cd828d857ac616371b0e5e82dbe23286564be2c5c9bc56924"
+      },
+      "output_changed": false
+    }
+  ]
+}

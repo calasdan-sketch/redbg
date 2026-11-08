@@ -2,6 +2,41 @@
 
 ## 0.3.0 - unreleased
 
+**Round 5 (evidence, privacy, observability):** details, scores and what could
+not be tested: `docs/ROUND5.md`.
+
+### Added
+- **`--sarif FILE` on `check` and `audit`**: SARIF 2.1.0 for code-scanning
+  dashboards (the tool block names `Calas Automations Inc.`).
+- **`redbg otel TRACE [-o FILE] [--with-args]`**: OTLP/JSON spans (one root
+  span per session, one per tool step). Deterministic ids; arguments left out
+  unless asked for, and then redacted. Sends nothing anywhere.
+- **`redbg digest TRACE [--expect SHA256] [--strict] [--json]`**: SHA-256 of
+  the file plus timeline anomalies (duplicate event ids, timestamps going
+  backwards, tool calls with no result). Still prints the hash of a file it
+  cannot parse (exit 2).
+- **Privacy flags for `redact` and `scan`**: `--paths` (user name in
+  `/home/NAME`, `/Users/NAME`, `C:\Users\NAME`), `--also WORD` (repeatable,
+  case-insensitive literal), and `--pii` now also covers IPv4 addresses (a
+  dotted version number like `1.2.3.4` is caught too). All opt-in.
+- `redbg.__author__`; `--help` footer names the publisher; `maintainers` in
+  the package metadata.
+- `bench/mutation_sanity.py` (breaks 20 conditions one at a time and checks
+  the tests notice), golden files for every output format
+  (`tests/golden`, refresh with `REDBG_UPDATE_GOLDEN=1`), a trace recorded by
+  the published 0.1.1 as an upgrade-path fixture, `.gitattributes` (LF line
+  endings so golden files and hashes survive a Windows checkout).
+
+### Fixed
+- A trace whose `call_id` / `id` was a list or object crashed loading with
+  `TypeError: unhashable type` (exit 2 "unexpected TypeError"). Such ids are now
+  matched by value.
+- A trace with non-text `output` / `error`, or non-object `args`, crashed
+  `why`, `replay --export-html` and `fork` with `TypeError`. They are coerced
+  to text / `{"_args": ...}` and `fork` ignores unusable arguments and tool
+  names instead of failing.
+- The sdist now carries the golden files and fixtures its tests need.
+
 **Round 4 (the stranger's first hour):**
 
 PyPI still serves 0.1.1; 0.2.0 was never published, so 0.3.0 is the first

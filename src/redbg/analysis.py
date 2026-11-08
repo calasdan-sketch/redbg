@@ -30,6 +30,7 @@ import shlex
 from dataclasses import dataclass, field
 
 from ._text import canonical_name
+from .schema import hashable_id
 
 READ_TOOLS = frozenset(
     "read view cat read_file open_file notebookread get_file_contents".split()
@@ -358,12 +359,14 @@ def explain(session, n: int, max_values: int = 12) -> Explanation:
             turn_start = i
             break
     turn_call_ids = {
-        e.get("id") for e in before[turn_start:] if e.get("type") == "tool_call"
+        hashable_id(e.get("id"))
+        for e in before[turn_start:]
+        if e.get("type") == "tool_call"
     }
     turn_steps = [
         (s.n, s.tool, s.ok)
         for s in session.steps[: n - 1]
-        if s.call is not None and s.call.get("id") in turn_call_ids
+        if s.call is not None and hashable_id(s.call.get("id")) in turn_call_ids
     ]
     exp = Explanation(
         step=n,

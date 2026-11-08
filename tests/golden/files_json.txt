@@ -1,0 +1,32 @@
+{
+  "wrong.py": [
+    {
+      "step": 1,
+      "kind": "read",
+      "path": "wrong.py",
+      "how": "declared",
+      "tool": "read_file",
+      "ok": false
+    }
+  ],
+  "main.py": [
+    {
+      "step": 2,
+      "kind": "read",
+      "path": "main.py",
+      "how": "declared",
+      "tool": "read_file",
+      "ok": true
+    }
+  ],
+  "summary.txt": [
+    {
+      "step": 3,
+      "kind": "write",
+      "path": "summary.txt",
+      "how": "declared",
+      "tool": "write_file",
+      "ok": true
+    }
+  ]
+}

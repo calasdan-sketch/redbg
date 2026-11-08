@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "redbg",
+          "version": "0.3.0",
+          "organization": "Calas Automations Inc.",
+          "informationUri": "https://github.com/calasdan-sketch/redbg",
+          "rules": [
+            {
+              "id": "invented_path",
+              "name": "invented_path",
+              "shortDescription": {
+                "text": "redbg audit finding: invented_path"
+              }
+            }
+          ]
+        }
+      },
+      "artifacts": [
+        {
+          "location": {
+            "uri": "sample-b.jsonl"
+          }
+        }
+      ],
+      "results": [
+        {
+          "ruleId": "invented_path",
+          "level": "error",
+          "message": {
+            "text": "read_file: 'wrong.py' appears nowhere the agent had seen and the call failed with a not-found error"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "sample-b.jsonl",
+                  "index": 0
+                }
+              },
+              "logicalLocations": [
+                {
+                  "name": "step 1",
+                  "kind": "member"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "step": 1
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+::error title=redbg check [divergence]::First divergence at A:— / B:1: step added in B ('read_file')
+::error title=redbg check [added]::baseline:— / candidate:1 'read_file': added

@@ -33,6 +33,7 @@ from .schema import (
     SESSION_START,
     TOOL_CALL,
     TOOL_RESULT,
+    hashable_id,
     new_event,
 )
 
@@ -204,11 +205,24 @@ def _renumber_history(history: list[dict]) -> None:
     for event in history:
         if event.get("type") == TOOL_CALL:
             next_n += 1
-            renumber[event.get("id")] = next_n
+            renumber[hashable_id(event.get("id"))] = next_n
             event["step"] = next_n
         elif event.get("type") == TOOL_RESULT:
-            if event.get("call_id") in renumber:
-                event["step"] = renumber[event["call_id"]]
+            key = hashable_id(event.get("call_id"))
+            if key in renumber:
+                event["step"] = renumber[key]
+
+
+def _as_args(value) -> dict:
+    """Tool arguments from an untrusted trace: a dict, else empty."""
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _as_tool(value) -> str:
+    """Tool name from an untrusted trace: always a string."""
+    if value is None:
+        return "unknown"
+    return value if isinstance(value, str) else str(value)
 
 
 def _run_playback(
@@ -221,11 +235,11 @@ def _run_playback(
         if etype == TOOL_RESULT:
             continue  # replaced by fresh execution; see below
         elif etype == TOOL_CALL:
-            args = dict(event.get("args", {}))
+            args = _as_args(event.get("args"))
             if first_call and spec.override_args is not None:
                 args = dict(spec.override_args)
             first_call = False
-            tool = event.get("tool", "unknown")
+            tool = _as_tool(event.get("tool"))
             call_id = uuid.uuid4().hex
             events.append(
                 new_event(TOOL_CALL, step=step, tool=tool, args=args, id=call_id)
@@ -315,7 +329,7 @@ def _run_live(events: list[dict], spec: ForkSpec, start_step: int) -> None:
                 f"got {type(reply).__name__}"
             )
         tool = reply["tool"]
-        args = dict(reply.get("args", {}))
+        args = _as_args(reply.get("args"))
         if first_call and spec.override_args is not None:
             args = dict(spec.override_args)
         first_call = False

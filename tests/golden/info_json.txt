@@ -1,0 +1,19 @@
+{
+  "path": "sample-b.jsonl",
+  "format": "redbg",
+  "agent": "demo-agent",
+  "session_id": "439ceee4d6b644c2bc208f948e475d82",
+  "status": "ok",
+  "steps": 3,
+  "failed": 1,
+  "tool_time_ms": 0.19014499957847875,
+  "prompts": 1,
+  "responses": 3,
+  "tools": {
+    "read_file": 2,
+    "write_file": 1
+  },
+  "usage": null,
+  "repeats": [],
+  "cycles": []
+}

@@ -178,6 +178,39 @@ _PII_VALUE_PATTERNS = [
     r"(?<![\d.\-])(?P<card>\d(?:[ \-]?\d){12,18})(?![\d\-])",
 ]
 PII_VALUE_RES = [re.compile(p) for p in _PII_VALUE_PATTERNS]
+# IPv4 addresses join the opt-in personal-data set: four 0-255 groups that are
+# not part of a longer dotted number (so "1.2.3.4.5" and "10.1.2.300" are left).
+_IPV4_PATTERN = (
+    r"(?<![\d.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}"
+    r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?!\d|\.\d)"
+)
+PII_VALUE_RES.append(re.compile(_IPV4_PATTERN))
+
+# ``--paths``: the user-name part of home folders (``/home/NAME``,
+# ``/Users/NAME``, ``C:\Users\NAME``). Only the name is replaced, so the rest
+# of the path stays readable and diffs still line up.
+_HOME_PATH_PATTERN = (
+    r"(?i)(?<![A-Za-z0-9_])(?:/home/|/Users/|[A-Za-z]:[\\/]+Users[\\/]+)"
+    r"(?!\[REDACTED\])(?P<secret>[^/\\\s\"'<>:|*?]{1,64})"
+)
+HOME_PATH_RES = [re.compile(_HOME_PATH_PATTERN)]
+
+
+def literal_term_res(terms) -> list[re.Pattern]:
+    """Patterns that redact each given word or phrase (case-insensitive).
+
+    For names, company names or host names that no secret pattern can know.
+    Refuses terms that are empty, shorter than 2 characters, or that would
+    match the redaction marker itself.
+    """
+    out: list[re.Pattern] = []
+    for term in terms:
+        if not isinstance(term, str) or len(term.strip()) < 2:
+            raise ValueError(f"--also needs words of at least 2 characters, got {term!r}")
+        if term.strip().casefold() in REDACTED.casefold():
+            raise ValueError(f"--also {term!r} would match the redaction marker itself")
+        out.append(re.compile("(?i)" + re.escape(term.strip())))
+    return out
 
 
 def luhn_ok(digits: str) -> bool:

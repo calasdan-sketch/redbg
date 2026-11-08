@@ -7,6 +7,7 @@ The schema is intentionally small. Unknown event types are preserved on load
 
 from __future__ import annotations
 
+import json
 import time
 import uuid
 from datetime import datetime, timezone
@@ -90,6 +91,17 @@ def validate_event(event: dict, allow_unknown_types: bool = False) -> list[str]:
         if field not in event:
             problems.append(f"missing required field for {etype}: {field}")
     return problems
+
+
+def hashable_id(value):
+    """``value`` usable as a dict key. Ids come from untrusted traces, so a
+    list or object (``"call_id": []``) must not crash indexing: it is keyed by
+    its JSON text instead (two equal lists still match each other)."""
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return ("unhashable", json.dumps(value, sort_keys=True, default=str))
 
 
 def is_step_event(event: dict) -> bool:

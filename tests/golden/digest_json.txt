@@ -1,0 +1,16 @@
+{
+  "path": "sample-b.jsonl",
+  "sha256": "e91aa9ee2f3473c319d138b54dd6ffdfe92e64d3e0376356b0f071921e6e8bac",
+  "bytes": 3411,
+  "format": "redbg",
+  "events": 12,
+  "steps": 3,
+  "open_steps": 0,
+  "first_ts": 1792423111.376,
+  "last_ts": 1792423111.377,
+  "duplicate_event_ids": 0,
+  "timestamps_going_backwards": 0,
+  "events_without_usable_timestamp": 0,
+  "anomalies": [],
+  "matches_expected": null
+}

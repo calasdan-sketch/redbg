@@ -1,0 +1,184 @@
+{
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": {
+              "stringValue": "demo-agent"
+            }
+          },
+          {
+            "key": "telemetry.sdk.name",
+            "value": {
+              "stringValue": "redbg"
+            }
+          },
+          {
+            "key": "telemetry.sdk.version",
+            "value": {
+              "stringValue": "0.3.0"
+            }
+          },
+          {
+            "key": "redbg.publisher",
+            "value": {
+              "stringValue": "Calas Automations Inc."
+            }
+          }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "redbg",
+            "version": "0.3.0"
+          },
+          "spans": [
+            {
+              "traceId": "1395819f3bd4dea243d5bbae0c9041fb",
+              "spanId": "846904cb4309fbad",
+              "name": "agent session (demo-agent)",
+              "kind": 1,
+              "startTimeUnixNano": "1792423111376000000",
+              "endTimeUnixNano": "1792423111377000192",
+              "attributes": [
+                {
+                  "key": "redbg.steps",
+                  "value": {
+                    "intValue": "3"
+                  }
+                },
+                {
+                  "key": "redbg.format",
+                  "value": {
+                    "stringValue": "redbg"
+                  }
+                }
+              ],
+              "status": {
+                "code": 0
+              }
+            },
+            {
+              "traceId": "1395819f3bd4dea243d5bbae0c9041fb",
+              "spanId": "23e21c540a5b2f02",
+              "parentSpanId": "846904cb4309fbad",
+              "name": "read_file",
+              "kind": 1,
+              "startTimeUnixNano": "1792423111376000000",
+              "endTimeUnixNano": "1792423111376000000",
+              "attributes": [
+                {
+                  "key": "redbg.step",
+                  "value": {
+                    "intValue": "1"
+                  }
+                },
+                {
+                  "key": "redbg.tool",
+                  "value": {
+                    "stringValue": "read_file"
+                  }
+                },
+                {
+                  "key": "redbg.complete",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "redbg.args",
+                  "value": {
+                    "stringValue": "{\"path\": \"wrong.py\"}"
+                  }
+                }
+              ],
+              "status": {
+                "code": 2,
+                "message": "no such file: wrong.py"
+              }
+            },
+            {
+              "traceId": "1395819f3bd4dea243d5bbae0c9041fb",
+              "spanId": "6422d4e0c262f44f",
+              "parentSpanId": "846904cb4309fbad",
+              "name": "read_file",
+              "kind": 1,
+              "startTimeUnixNano": "1792423111377000192",
+              "endTimeUnixNano": "1792423111377000192",
+              "attributes": [
+                {
+                  "key": "redbg.step",
+                  "value": {
+                    "intValue": "2"
+                  }
+                },
+                {
+                  "key": "redbg.tool",
+                  "value": {
+                    "stringValue": "read_file"
+                  }
+                },
+                {
+                  "key": "redbg.complete",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "redbg.args",
+                  "value": {
+                    "stringValue": "{\"path\": \"main.py\"}"
+                  }
+                }
+              ],
+              "status": {
+                "code": 1
+              }
+            },
+            {
+              "traceId": "1395819f3bd4dea243d5bbae0c9041fb",
+              "spanId": "ebeb8c86b49bd65f",
+              "parentSpanId": "846904cb4309fbad",
+              "name": "write_file",
+              "kind": 1,
+              "startTimeUnixNano": "1792423111377000192",
+              "endTimeUnixNano": "1792423111377000192",
+              "attributes": [
+                {
+                  "key": "redbg.step",
+                  "value": {
+                    "intValue": "3"
+                  }
+                },
+                {
+                  "key": "redbg.tool",
+                  "value": {
+                    "stringValue": "write_file"
+                  }
+                },
+                {
+                  "key": "redbg.complete",
+                  "value": {
+                    "boolValue": true
+                  }
+                },
+                {
+                  "key": "redbg.args",
+                  "value": {
+                    "stringValue": "{\"path\": \"summary.txt\", \"content\": \"main.py prints hello\\n\"}"
+                  }
+                }
+              ],
+              "status": {
+                "code": 1
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

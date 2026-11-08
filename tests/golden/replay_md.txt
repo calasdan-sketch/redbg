@@ -1,0 +1,55 @@
+# redbg session: `sample-b.jsonl`
+
+- agent: `demo-agent`
+- session id: `439ceee4d6b644c2bc208f948e475d82`
+- status: `ok`
+- steps: 3
+
+## step 1: `read_file` (FAIL, 0.1 ms)
+
+```json
+{
+  "path": "wrong.py"
+}
+```
+
+**error:**
+
+```
+no such file: wrong.py
+```
+
+## step 2: `read_file` (ok, 0.1 ms)
+
+```json
+{
+  "path": "main.py"
+}
+```
+
+<details><summary>output</summary>
+
+```
+def main():
+    print("hello")
+
+```
+
+</details>
+
+## step 3: `write_file` (ok, 0.1 ms)
+
+```json
+{
+  "content": "main.py prints hello\n",
+  "path": "summary.txt"
+}
+```
+
+<details><summary>output</summary>
+
+```
+wrote 19 bytes
+```
+
+</details>

@@ -3,7 +3,8 @@
 **Open any agent transcript — Claude Code, Codex, OpenAI/Anthropic message
 logs, or your own — find the exact step where it went wrong, ask *why* it did
 that, and fail CI when it happens again.** Local files, no account, no server,
-zero dependencies. A 100 MB transcript shows its first step in about 0.1 s.
+zero dependencies. A 100 MB transcript shows its first step in well under a second
+(0.07-0.10 s on a quiet machine, measured).
 
 Record tool-calling agent sessions, then debug them like a program:
 **step** forward/back through tool calls, **inspect** the exact
@@ -283,6 +284,54 @@ redbg import otel.json -o out.jsonl     # convert OTel/Langfuse-shaped traces
 UTF-8 BOM and UTF-16/32 files (what PowerShell's `>` writes) open directly.
 Token counts show up in `info` when the trace has them (below).
 
+## Reports for other tools, and evidence
+
+```bash
+redbg check run.jsonl --baseline good.jsonl --sarif redbg.sarif   # code-scanning dashboards
+redbg audit run.jsonl --sarif audit.sarif
+redbg otel  run.jsonl -o run.otlp.json       # OpenTelemetry (OTLP/JSON) spans; sends nothing
+redbg digest run.jsonl                       # SHA-256 + timeline anomalies
+redbg digest run.jsonl --expect <sha256>     # exit 1 if the file is not the one you saved
+```
+
+- **SARIF 2.1.0** (`check`, `audit`): one result per violation or finding
+  (`audit`: high = error, medium = warning, low = note). A trace has no source
+  lines, so a result points at the trace file and names the step
+  (`logicalLocations`, `properties.step`). Three generated documents were
+  checked against the published SARIF 2.1.0 JSON schema; whether GitHub's
+  upload step accepts a result without a line number was not tried.
+- **`otel`** writes an OTLP/JSON `resourceSpans` document: one root span per
+  session and one child span per tool step (error status for failed steps).
+  Ids are derived from the session id, so exporting twice gives identical
+  bytes. Tool arguments are **left out** unless you pass `--with-args`, and
+  are then redacted first. Nothing is sent to any server; load the file with
+  whatever reads OTLP/JSON (for example an OpenTelemetry Collector). Attribute
+  names are `redbg.*`; no OpenTelemetry semantic-convention names are claimed.
+- **`digest`** prints the SHA-256 of the file exactly as stored (a `.gz` file
+  hashes its compressed bytes), the event/step counts, and anomalies that
+  suggest a spliced or damaged file: duplicate event ids, timestamps going
+  backwards, tool calls with no result. A damaged file still gets its hash
+  (exit 2). It detects accidents and crude edits; it is **not** tamper-proof,
+  since anyone who can edit the file can edit the hash you stored beside it.
+
+## Sharing a transcript safely
+
+```bash
+redbg scan    raw.jsonl --pii --paths --also "Acme Corp"      # what would be removed?
+redbg redact  raw.jsonl -o shareable.jsonl --pii --paths --also "Acme Corp"
+redbg scan    shareable.jsonl --pii --paths --also "Acme Corp"   # must say clean
+```
+
+Works on Claude Code and Codex transcripts as well as redbg traces (the
+output keeps the input's format). Beyond secrets, three opt-in layers:
+`--pii` (e-mail, IPv4 and Luhn-valid card numbers; a dotted version number such
+as `1.2.3.4` looks like an IP and is redacted too), `--paths` (the user-name
+part of `/home/NAME`, `/Users/NAME`, `C:\Users\NAME`; the rest of the path
+stays so diffs still line up) and `--also WORD` (your name, company or host
+names, case-insensitive, repeatable). Not covered: names in free prose you did
+not list, JSON key names, phone numbers, street addresses. `--redact` on other
+commands, `--export-html` and `import --redact` apply the secret rules only.
+
 ## Python API
 
 ```python
@@ -367,9 +416,10 @@ to an existing trace):
   `Set-Cookie:` values, `Authorization: <scheme> value`, `curl -u user:pass`
   and `mysql -pSECRET`.
 - **Personal data, opt-in** — `redbg scan --pii` / `redbg redact --pii` also
-  flag e-mail addresses and card numbers that pass the Luhn check. Off by
-  default (addresses are everywhere in normal prose). Phone numbers, names
-  and addresses are not detected.
+  flag e-mail addresses, IPv4 addresses and card numbers that pass the Luhn
+  check; `--paths` and `--also` are described under "Sharing a transcript
+  safely". Off by default (addresses are everywhere in normal prose). Phone
+  numbers, street addresses and names you did not list are not detected.
 
 Kept on purpose, so cost and usage stay debuggable: numeric (or
 digit-only string) LLM usage counters such as `max_tokens`,
@@ -477,6 +527,7 @@ Only statements we could check against each project's own page are listed.
 | Fork from a step | yes (playback or live) | yes (cached replay) | yes (checkpoints) | yes ("time travel") | — | — |
 | CI regression gate | `redbg check` (exit codes, GitHub annotations, JUnit) | yes: Python `Assertions` vs a baseline (steps, models, tool calls, errors, token usage with tolerance); GitHub Action not re-verified | — | — | — | replay tests |
 | Policy rules on tools / files / commands / token budget | yes | not on its PyPI page |
+| SARIF / OpenTelemetry export, secret redaction | yes (`--sarif`, `otel`, `redact`) | not on its PyPI page | — | — | — | — |
 | Loop detection | identical calls, back-to-back or alternating (2-8 call cycles) | — | — | "recursive thought detection" | — | — |
 | Auto-instrumentation | **no** | yes (OpenAI Agents SDK, Pydantic AI) | built in | unverified | unverified | yes (patches provider SDKs) |
 | Web UI | **no** | not on its PyPI page (earlier read: yes) | unverified | yes (hosted dashboard) | yes | no (CLI) |
@@ -490,7 +541,9 @@ adds a terminal UI and per-session cost questions to its HTML export; redbg
 counts tokens but does not price them. Its PyPI metadata (read
 2026-11-07) requires Python 3.10+ and installs click, dateparser, gitpython,
 jinja2, pydantic and others; redbg needs Python 3.9+ and nothing else.
-Where redbg is weaker: no auto-instrumentation, no web UI, no LLM-judge
+The 2026-11-08 re-read of the rewind and claude-code-log PyPI descriptions found
+no mention of SARIF, OpenTelemetry, redaction or hashing (descriptions only,
+not their repositories). Where redbg is weaker: no auto-instrumentation, no web UI, no LLM-judge
 scoring (rewind's earlier-read repo listed these; not re-checked). Where it aims to be stronger: nothing to run
 or sign up for, a plain JSONL format you can grep, and a diff that tells
 you the *first* step that diverged.
@@ -503,7 +556,7 @@ host). Peak memory is the process's maximum resident size.
 
 | | what it does | 100 MB synthetic transcript | 7 MB real transcript |
 |---|---|---|---|
-| **redbg 0.3** | interactive debugger | first step on screen in **0.07-0.10 s** on a quiet host (0.25-0.40 s when the host's load average was ~10); full load 1.4 s quiet / 3.3 s loaded, 108 MB (re-measured in round 4 at load ~9: 0.27-0.44 s and 1.9-3.1 s, same memory; indistinguishable from the previous commit run side by side, see `bench/RESULTS.md`) | first step 0.07 s, 19 MB |
+| **redbg 0.3** | interactive debugger | first step on screen in **0.07-0.10 s** on a quiet host (0.25-0.40 s when the host's load average was ~10); full load 1.4 s quiet / 3.3 s loaded, 108 MB (re-measured in round 4 at load ~9: 0.27-0.44 s and 1.9-3.1 s, same memory; indistinguishable from the previous commit run side by side, see `bench/RESULTS.md`; round 5 at load 9-11: 0.28-0.57 s and 2.8-3.4 s, memory unchanged, and a side-by-side run on 25 MB inputs showed no consistent change) | first step 0.07 s, 19 MB |
 | redbg 0.2 (before) | interactive debugger | cannot open (rejects the format) | cannot open |
 | [claude-code-transcripts](https://pypi.org/project/claude-code-transcripts/) 0.6 (`json`) | static HTML pages | 6.2 s, 267 MB, writes 88 MB of HTML | 0.4 s, 49 MB |
 | [claude-code-log](https://pypi.org/project/claude-code-log/) 1.7.0 | static HTML/Markdown | not run: its strict validation rejected our synthetic attachment lines | 1.7 s, 94 MB |

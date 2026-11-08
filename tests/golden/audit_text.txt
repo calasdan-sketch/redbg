@@ -1,0 +1,3 @@
+audit: 1 finding(s) in sample-b.jsonl
+  HIGH   invented_path   step 1    read_file: 'wrong.py' appears nowhere the agent had seen and the call failed with a not-found error
+  leads, not verdicts: check with `redbg why TRACE N`

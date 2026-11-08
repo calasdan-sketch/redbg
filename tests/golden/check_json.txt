@@ -1,0 +1,22 @@
+{
+  "passed": false,
+  "candidate": "sample-b.jsonl",
+  "baseline": "sample-a.jsonl",
+  "checked": [
+    "non_empty",
+    "complete",
+    "baseline"
+  ],
+  "violations": [
+    {
+      "rule": "divergence",
+      "message": "First divergence at A:\u2014 / B:1: step added in B ('read_file')",
+      "step": 1
+    },
+    {
+      "rule": "added",
+      "message": "baseline:\u2014 / candidate:1 'read_file': added",
+      "step": 1
+    }
+  ]
+}

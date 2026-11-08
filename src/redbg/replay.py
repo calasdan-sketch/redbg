@@ -22,6 +22,7 @@ from .schema import (
     TOOL_CALL,
     TOOL_RESULT,
     USAGE,
+    hashable_id,
     new_event,
     validate_event,
 )
@@ -181,7 +182,9 @@ class Step:
 
     @property
     def args(self) -> dict:
-        return (self.call or {}).get("args", {})
+        raw = (self.call or {}).get("args", {})
+        # Traces are untrusted: a list or number here must not break callers.
+        return raw if isinstance(raw, dict) else {"_args": raw}
 
     @property
     def ok(self) -> bool | None:
@@ -202,7 +205,7 @@ class Step:
     def output(self) -> str | None:
         if self.result is None:
             return None
-        return self.result.get("output")
+        return _text_or_none(self.result.get("output"))
 
     @property
     def output_sha256(self) -> str | None:
@@ -214,7 +217,14 @@ class Step:
     def error(self) -> str | None:
         if self.result is None:
             return None
-        return self.result.get("error")
+        return _text_or_none(self.result.get("error"))
+
+
+def _text_or_none(value) -> str | None:
+    """Output/error fields are text; coerce odd JSON values instead of crashing."""
+    if value is None or isinstance(value, str):
+        return value
+    return json.dumps(value, default=str, ensure_ascii=False)
 
 
 @dataclass
@@ -330,7 +340,7 @@ class Session:
                     prompt_ctx=last_prompt,
                     response_ctx=last_response,
                 )
-                call_id = event.get("id")
+                call_id = hashable_id(event.get("id"))
                 # A result may have arrived before its call (out-of-order
                 # writers); attach it now if we buffered one.
                 if call_id in pending_results:
@@ -338,7 +348,7 @@ class Session:
                 by_call_id[call_id] = step
                 steps.append(step)
             elif etype == TOOL_RESULT:
-                call_id = event.get("call_id")
+                call_id = hashable_id(event.get("call_id"))
                 found = by_call_id.get(call_id)
                 if found is not None:
                     found.result = event

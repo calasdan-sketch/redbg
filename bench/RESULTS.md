@@ -2,11 +2,11 @@
 
 Python 3.13.18 on Linux x86_64; best of 3 for time-to-first-view, single run for load. Re-run: `python bench/bench.py`.
 
-Host load average (1/5/15 min) at the end of the run: 8.9/10.6/10.7. Absolute times scale with it; compare rows within one table.
+Host load average (1/5/15 min) at the end of the run: 11.2/12.0/11.2. Absolute times scale with it; compare rows within one table. Round 5 run (baseline = round 4 commit d075e74): the `current` rows ran first and the baseline second, so a one-sided gap is not evidence; see docs/ROUND5.md for the interleaved comparison.
 
-| version | input | file MB | steps | full load | peak memory | time to first view | `why` (mid-step) | `audit` | `check` vs itself |
-|---|---|---|---|---|---|---|---|---|---|
-| current | redbg native | 105 | 26643 | 1.94 s | 195 MB | 0.27 s | 1.83 s | 62.61 s | 5.94 s |
-| current | Claude Code | 105 | 14947 | 3.14 s | 108 MB | 0.44 s | 4.38 s | 45.27 s | 5.86 s |
-| 6f8ad30 | redbg native | 105 | 26643 | 1.21 s | 195 MB | 0.12 s | 3.16 s | 79.25 s | 7.08 s |
-| 6f8ad30 | Claude Code | 105 | 14947 | 3.81 s | 108 MB | 0.41 s | 4.51 s | 34.61 s | 4.17 s |
+| version | input | file MB | steps | full load | peak memory | time to first view | `why` (mid-step) | `audit` | `check` vs itself | `otel` | `digest` |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| current | redbg native | 105 | 26643 | 2.17 s | 195 MB | 0.36 s | 4.19 s | 106.94 s | 10.35 s | 5.18 s | 4.33 s |
+| current | Claude Code | 105 | 14947 | 5.22 s | 108 MB | 0.44 s | 5.61 s | 57.70 s | 10.88 s | 5.58 s | 5.22 s |
+| d075e74 | redbg native | 105 | 26643 | 2.24 s | 195 MB | 0.27 s | 3.35 s | 105.48 s | 9.08 s | - | - |
+| d075e74 | Claude Code | 105 | 14947 | 4.15 s | 108 MB | 0.25 s | 3.19 s | 44.59 s | 8.79 s | - | - |

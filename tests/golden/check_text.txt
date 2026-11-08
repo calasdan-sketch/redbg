@@ -1,0 +1,4 @@
+✗ check FAILED: sample-b.jsonl vs baseline sample-a.jsonl
+  [divergence] First divergence at A:— / B:1: step added in B ('read_file')
+  [added] baseline:— / candidate:1 'read_file': added
+  rules: non_empty, complete, baseline

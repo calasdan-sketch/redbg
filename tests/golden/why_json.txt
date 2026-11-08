@@ -1,0 +1,42 @@
+{
+  "step": 3,
+  "tool": "write_file",
+  "ok": true,
+  "prompt": "Summarize what main.py does.",
+  "model_text": "main.py defines main(), which prints 'hello'.",
+  "turn_steps": [
+    [
+      1,
+      "read_file",
+      false
+    ],
+    [
+      2,
+      "read_file",
+      true
+    ]
+  ],
+  "next_steps": [],
+  "provenance": [
+    {
+      "value": "summary.txt",
+      "origin": "nowhere",
+      "step": null
+    },
+    {
+      "value": "main.py",
+      "origin": "prompt",
+      "step": null
+    }
+  ],
+  "effects": [
+    {
+      "step": 3,
+      "kind": "write",
+      "path": "summary.txt",
+      "how": "declared",
+      "tool": "write_file",
+      "ok": true
+    }
+  ]
+}

@@ -16,6 +16,8 @@ Subcommands:
                       commands, loops, secrets)
   files TRACE         which files each step read / wrote / deleted
   blame TRACE PATH    which steps touched PATH
+  otel TRACE          export OTLP/JSON spans (sends nothing)
+  digest TRACE        SHA-256 fingerprint + timeline anomalies
 
 Every command opens redbg traces, Claude Code transcripts, Codex rollouts and
 OpenAI/Anthropic message logs directly (format auto-detected).
@@ -36,16 +38,27 @@ from typing import Any
 
 from . import __version__
 from ._fs import explain_oserror
+from ._meta import AUTHOR
 from ._text import clean, md_fence
 from .analysis import Breakpoint, blame, explain, file_ledger, run_to_breakpoint
 from .audit import audit
 from .check import FAIL_ON_CHOICES, CheckRules, run_check, to_github, to_junit
 from .diff import diff_to_dict, find_cycles, find_repeats, render_diff
+from .forensics import anomalies, digest_session, file_sha256
 from .fork import ForkSpec, fork_session
 from .htmlexport import render_html
 from .importer import import_file
-from .redact import DEFAULT_VALUE_RES, PII_VALUE_RES, redact_file, scan_file
+from .otlp import session_to_otlp
+from .redact import (
+    DEFAULT_VALUE_RES,
+    HOME_PATH_RES,
+    PII_VALUE_RES,
+    literal_term_res,
+    redact_file,
+    scan_file,
+)
 from .replay import Navigator, Session, ensure_distinct
+from .sarif import audit_to_sarif, check_to_sarif
 
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -670,6 +683,11 @@ def cmd_audit(args) -> int:
     findings = audit(session, check_secrets=not args.no_secrets)
     order = {"high": 0, "medium": 1, "low": 2}
     findings = [f for f in findings if order[f.severity] <= order[args.min_severity]]
+    if args.sarif and not _write_report(
+        args.sarif, audit_to_sarif(findings, session.path, __version__), "--sarif",
+        args.trace,
+    ):
+        return 2
     if args.json:
         print(json.dumps([f.to_dict() for f in findings], indent=2))
     else:
@@ -768,13 +786,15 @@ def cmd_check(args) -> int:
         print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
         return 2
     result = run_check(candidate, rules, baseline)
-    if args.junit:
-        try:
-            with open(args.junit, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(to_junit(result))
-        except OSError as exc:
-            print(f"redbg: --junit report not written: {_why_failed(exc)}", file=sys.stderr)
-            return 2
+    if args.junit and not _write_report(
+        args.junit, to_junit(result), "--junit", args.trace, args.baseline or ""
+    ):
+        return 2
+    if args.sarif and not _write_report(
+        args.sarif, check_to_sarif(result, __version__), "--sarif",
+        args.trace, args.baseline or "",
+    ):
+        return 2
     if args.github:
         print(to_github(result, args.limit))
         return 0 if result.passed else 1
@@ -873,7 +893,33 @@ def cmd_fork(args) -> int:
 
 
 def _value_res(args):
-    return DEFAULT_VALUE_RES + (PII_VALUE_RES if getattr(args, "pii", False) else [])
+    res = list(DEFAULT_VALUE_RES)
+    if getattr(args, "pii", False):
+        res += PII_VALUE_RES
+    if getattr(args, "paths", False):
+        res += HOME_PATH_RES
+    also = getattr(args, "also", None)
+    if also:
+        res += literal_term_res(also)
+    return res
+
+
+def _write_report(path: str, text: str, flag: str, *inputs: str) -> bool:
+    """Write a side-report file (LF newlines); say why on stderr if it fails.
+
+    Refuses to write over one of the ``inputs`` (a typo like
+    ``--sarif run.jsonl`` must not destroy the trace it was reporting on).
+    """
+    try:
+        for src in inputs:
+            if src:
+                ensure_distinct(src, path)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+    except (OSError, ValueError) as exc:
+        print(f"redbg: {flag} report not written: {_why_failed(exc)}", file=sys.stderr)
+        return False
+    return True
 
 
 def cmd_redact(args) -> int:
@@ -886,6 +932,69 @@ def cmd_redact(args) -> int:
         f"redacted {stats['redactions']} value(s) across "
         f"{stats['events']} events -> {stats['dst']}"
     )
+    return 0
+
+
+def cmd_otel(args) -> int:
+    session = _load_or_fail(args, redact=args.redact)
+    if session is None:
+        return 2
+    text = json.dumps(
+        session_to_otlp(session, __version__, with_args=args.with_args), indent=2
+    )
+    if args.dst:
+        if not _write_report(args.dst, text + "\n", "otel", args.trace):
+            return 2
+        print(f"wrote {len(session.steps)} step span(s) -> {args.dst}")
+    else:
+        print(text)
+    return 0
+
+
+def cmd_digest(args) -> int:
+    try:
+        sha, size = file_sha256(args.trace)
+    except OSError as exc:
+        print(f"redbg: {_why_failed(exc)}", file=sys.stderr)
+        return 2
+    mismatch = bool(args.expect) and args.expect.strip().lower() != sha
+    # A damaged file is exactly when a fingerprint matters: report it even if
+    # the trace cannot be parsed, then exit 2 (could not fully run).
+    parse_error = None
+    info: dict = {"path": args.trace, "sha256": sha, "bytes": size}
+    try:
+        session = Session.load(args.trace, skip_bad=args.skip_bad)
+        info.update(digest_session(session))
+    except (ValueError, OSError) as exc:
+        parse_error = _why_failed(exc)
+    problems = anomalies(info) if parse_error is None else []
+    if args.json:
+        info["anomalies"] = problems
+        info["matches_expected"] = (not mismatch) if args.expect else None
+        if parse_error:
+            info["error"] = parse_error
+        print(json.dumps(info, indent=2))
+    else:
+        print(clean(f"{args.trace}"))
+        print(f"  sha256: {sha}")
+        if parse_error is None:
+            print(
+                f"  size:   {size} bytes, {info['events']} events, "
+                f"{info['steps']} steps ({info['format']})"
+            )
+        else:
+            print(f"  size:   {size} bytes")
+        if args.expect:
+            print("  expected hash: " + ("MATCHES" if not mismatch else "DOES NOT MATCH"))
+        for line in problems:
+            print(f"  anomaly: {line}")
+        if parse_error is None and not problems:
+            print("  timeline: no anomalies found")
+    if parse_error:
+        print(f"redbg: {parse_error}", file=sys.stderr)
+        return 2
+    if mismatch or (args.strict and problems):
+        return 1
     return 0
 
 
@@ -1092,7 +1201,27 @@ def _add_common(parser) -> None:
     )
 
 
-_PII_HELP = "also treat e-mail addresses and Luhn-valid card numbers as sensitive"
+_PII_HELP = (
+    "also treat e-mail addresses, IPv4 addresses and Luhn-valid card numbers "
+    "as sensitive (a dotted version number like 1.2.3.4 looks like an IP)"
+)
+
+
+def _add_privacy(parser) -> None:
+    parser.add_argument("--pii", action="store_true", help=_PII_HELP)
+    parser.add_argument(
+        "--paths",
+        action="store_true",
+        help="also replace the user name in home folders (/home/NAME, "
+        "/Users/NAME, C:\\Users\\NAME)",
+    )
+    parser.add_argument(
+        "--also",
+        action="append",
+        metavar="TERM",
+        help="also replace this word or phrase wherever it appears "
+        "(case-insensitive; your name, company, host); repeatable",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1100,6 +1229,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="redbg",
         description="gdb for agent sessions.",
         epilog=(
+            f"redbg {__version__} - {AUTHOR} (MIT)\n"
             "new here? run `redbg demo` to get two example traces.\n"
             "exit codes: 0 ok, 1 problems found (check/scan/audit --strict), "
             "2 could not run (bad input, bad option, unwritable output), "
@@ -1242,6 +1372,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--allow-incomplete", action="store_true")
     p.add_argument(
+        "--sarif",
+        metavar="FILE",
+        help="also write a SARIF 2.1.0 report (for code-scanning dashboards)",
+    )
+    p.add_argument(
         "--allow-empty",
         action="store_true",
         help="accept a trace with zero tool steps / a check with no rules",
@@ -1299,15 +1434,41 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("redact", help="strip secrets from a trace")
     p.add_argument("src")
     p.add_argument("-o", "--dst", required=True)
-    p.add_argument("--pii", action="store_true", help=_PII_HELP)
+    _add_privacy(p)
     _add_common(p)
     p.set_defaults(func=cmd_redact)
 
     p = sub.add_parser("scan", help="audit a trace for likely secrets")
     p.add_argument("trace")
-    p.add_argument("--pii", action="store_true", help=_PII_HELP)
+    _add_privacy(p)
     _add_common(p)
     p.set_defaults(func=cmd_scan)
+
+    p = sub.add_parser(
+        "otel", help="export a session as OpenTelemetry (OTLP/JSON) spans; sends nothing"
+    )
+    p.add_argument("trace")
+    p.add_argument("-o", "--dst", metavar="FILE", help="write here (default: print)")
+    p.add_argument(
+        "--with-args",
+        action="store_true",
+        help="include tool arguments (redacted first); off by default",
+    )
+    _add_common(p)
+    p.set_defaults(func=cmd_otel)
+
+    p = sub.add_parser(
+        "digest", help="fingerprint a trace file (SHA-256) and check its timeline"
+    )
+    p.add_argument("trace")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--expect", metavar="SHA256", help="exit 1 unless the file hashes to this")
+    p.add_argument(
+        "--strict", action="store_true", help="exit 1 if the timeline has anomalies"
+    )
+    p.add_argument("--skip-bad", action="store_true", help="skip malformed lines")
+    p.add_argument("--no-color", action="store_true", help="disable ANSI colors")
+    p.set_defaults(func=cmd_digest)
 
     p = sub.add_parser("info", help="summarize a session")
     p.add_argument("trace")
@@ -1344,6 +1505,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=50, help="max findings (0 = all)")
     p.add_argument("--no-secrets", action="store_true", help="skip the credential scan")
     p.add_argument("--strict", action="store_true", help="exit 1 if any high finding")
+    p.add_argument(
+        "--sarif",
+        metavar="FILE",
+        help="also write a SARIF 2.1.0 report (high=error, medium=warning, low=note)",
+    )
     _add_common(p)
     p.set_defaults(func=cmd_audit)
 
